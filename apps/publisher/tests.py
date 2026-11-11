@@ -6,8 +6,15 @@ from unittest.mock import MagicMock, patch
 from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
-from apps.publisher.engine import MAX_RETRIES, RETRY_BACKOFF, PublishEngine, _resolve_publish_credentials
+from apps.publisher.engine import (
+    DOCUMENT_NOT_ALONE_MESSAGE,
+    MAX_RETRIES,
+    RETRY_BACKOFF,
+    PublishEngine,
+    _resolve_publish_credentials,
+)
 from apps.publisher.models import PublishLog, RateLimitState
+from providers.exceptions import PublishError
 from providers.types import AuthType, PostType, PublishResult
 
 
@@ -694,3 +701,234 @@ class MediaTypePropagationTest(SimpleTestCase):
         self.assertEqual(len(content.media_types), len(content.media_urls))
         self.assertEqual(content.media_types, ["video"])
         self.assertTrue(content.is_video(0))
+
+
+class ResolveLinkedInPostTypeTest(SimpleTestCase):
+    """LinkedIn gets MULTI_IMAGE / DOCUMENT; Instagram and Threads keep CAROUSEL."""
+
+    def _resolve(self, platform, media_count, first_media_type, platform_extra=None):
+        return PublishEngine._resolve_post_type(
+            platform=platform,
+            platform_extra=platform_extra or {},
+            media_count=media_count,
+            first_media_type=first_media_type,
+        )
+
+    def test_linkedin_several_images_is_multi_image(self):
+        for platform in ("linkedin_personal", "linkedin_company"):
+            self.assertEqual(self._resolve(platform, 6, "image"), PostType.MULTI_IMAGE)
+
+    def test_linkedin_single_image_stays_image(self):
+        self.assertEqual(self._resolve("linkedin_company", 1, "image"), PostType.IMAGE)
+
+    def test_linkedin_pdf_is_document(self):
+        for platform in ("linkedin_personal", "linkedin_company"):
+            self.assertEqual(self._resolve(platform, 1, "document"), PostType.DOCUMENT)
+
+    def test_linkedin_video_stays_video(self):
+        self.assertEqual(self._resolve("linkedin_personal", 1, "video"), PostType.VIDEO)
+
+    def test_linkedin_gif_first_is_multi_image(self):
+        # Media-library, API and MCP uploads store GIFs as "gif", not "image".
+        # Before, a GIF first sent the post to TEXT and dropped every image.
+        for platform in ("linkedin_personal", "linkedin_company"):
+            self.assertEqual(self._resolve(platform, 3, "gif"), PostType.MULTI_IMAGE)
+
+    def test_instagram_and_threads_unchanged(self):
+        self.assertEqual(self._resolve("instagram", 6, "image"), PostType.CAROUSEL)
+        self.assertEqual(self._resolve("instagram_login", 2, "image"), PostType.CAROUSEL)
+        self.assertEqual(self._resolve("threads", 2, "image"), PostType.CAROUSEL)
+        self.assertEqual(self._resolve("instagram", 1, "image"), PostType.IMAGE)
+
+    def test_other_platforms_do_not_get_multi_image(self):
+        self.assertEqual(self._resolve("facebook", 3, "image"), PostType.IMAGE)
+
+    def test_explicit_hint_still_wins(self):
+        self.assertEqual(self._resolve("linkedin_company", 6, "image", {"post_type": "image"}), PostType.IMAGE)
+
+    def test_linkedin_carousel_hint_becomes_multi_image(self):
+        # LinkedIn has no organic carousel; its multi-image post is the same thing.
+        for platform in ("linkedin_personal", "linkedin_company"):
+            self.assertEqual(self._resolve(platform, 6, "image", {"post_type": "carousel"}), PostType.MULTI_IMAGE)
+        self.assertEqual(self._resolve("instagram", 6, "image", {"post_type": "carousel"}), PostType.CAROUSEL)
+
+
+class DocumentOnUnsupportedPlatformTest(TestCase):
+    """A PDF on a platform without document posts fails loudly instead of posting the caption alone."""
+
+    def setUp(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        from apps.composer.models import PlatformPost, Post, PostMedia
+        from apps.media_library.models import MediaAsset
+        from apps.organizations.models import Organization
+        from apps.social_accounts.models import SocialAccount
+        from apps.workspaces.models import Workspace
+
+        self.org = Organization.objects.create(name="Org")
+        self.workspace = Workspace.objects.create(organization=self.org, name="WS")
+        self.post = Post.objects.create(workspace=self.workspace, caption="Swipe through")
+        asset = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            file=SimpleUploadedFile("carousel.pdf", b"%PDF-1.7\n%%EOF\n", content_type="application/pdf"),
+            filename="carousel.pdf",
+            media_type=MediaAsset.MediaType.DOCUMENT,
+            mime_type="application/pdf",
+        )
+        PostMedia.objects.create(post=self.post, media_asset=asset, position=0)
+        self.platform_posts = {}
+        for platform in ("facebook", "instagram"):
+            account = SocialAccount.objects.create(
+                workspace=self.workspace,
+                platform=platform,
+                account_platform_id=f"{platform}-1",
+                account_name=platform,
+                connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+            )
+            self.platform_posts[platform] = PlatformPost.objects.create(
+                post=self.post, social_account=account, status=PlatformPost.Status.PUBLISHING
+            )
+
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_pdf_fails_permanently_with_a_clear_message(self, _mock_creds):
+        from apps.composer.models import PlatformPost
+        from providers.facebook import FacebookProvider
+        from providers.instagram import InstagramProvider
+
+        for platform, provider_cls in (("facebook", FacebookProvider), ("instagram", InstagramProvider)):
+            with self.subTest(platform=platform), patch.object(provider_cls, "publish_post") as mock_publish:
+                platform_post = self.platform_posts[platform]
+                result = PublishEngine()._publish_platform_post(platform_post)
+
+                self.assertFalse(result["success"])
+                mock_publish.assert_not_called()
+                platform_post.refresh_from_db()
+                self.assertEqual(platform_post.status, PlatformPost.Status.FAILED)
+                self.assertEqual(platform_post.retry_count, 0)
+                self.assertIsNone(platform_post.next_retry_at)
+                self.assertEqual(
+                    platform_post.publish_error,
+                    "PDF documents can only be published to LinkedIn. Remove the PDF or this account.",
+                )
+                self.assertEqual(PublishLog.objects.filter(platform_post=platform_post).count(), 1)
+
+
+def _linkedin_attachment(filename, media_type, data, alt_text=""):
+    import io
+
+    pm = MagicMock()
+    asset = pm.media_asset
+    asset.filename = filename
+    asset.media_type = media_type
+    asset.alt_text = alt_text
+    asset.duration = None
+    asset.file.url = f"/media/{filename}"
+    asset.file.open.side_effect = lambda *a, **k: io.BytesIO(data)
+    return pm
+
+
+class DispatchLinkedInMediaTest(SimpleTestCase):
+    """_dispatch_to_provider hands LinkedIn the right post type and extras."""
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_six_images_dispatch_as_multi_image_with_alt_texts(self, _mock_creds, mock_get_provider):
+        engine, platform_post, mock_provider = _build_dispatch_mocks("linkedin_company", "98765")
+        attachments = [
+            _linkedin_attachment(f"slide-0{i}.png", "image", b"\x89PNG", alt_text=f"Slide {i}") for i in range(1, 7)
+        ]
+        platform_post.post.media_attachments.select_related.return_value.order_by.return_value = attachments
+        mock_get_provider.return_value = mock_provider
+
+        engine._dispatch_to_provider(platform_post)
+
+        _token, content = mock_provider.publish_post.call_args.args
+        self.assertEqual(content.post_type, PostType.MULTI_IMAGE)
+        self.assertEqual(len(content.media_files), 6)
+        self.assertEqual(content.extra["media_alt_texts"], [f"Slide {i}" for i in range(1, 7)])
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_carousel_hint_still_gets_alt_texts(self, _mock_creds, mock_get_provider):
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            "linkedin_company", "98765", platform_extra={"post_type": "carousel"}
+        )
+        attachments = [
+            _linkedin_attachment(f"slide-0{i}.png", "image", b"\x89PNG", alt_text=f"Slide {i}") for i in (1, 2)
+        ]
+        platform_post.post.media_attachments.select_related.return_value.order_by.return_value = attachments
+        mock_get_provider.return_value = mock_provider
+
+        engine._dispatch_to_provider(platform_post)
+
+        _token, content = mock_provider.publish_post.call_args.args
+        self.assertEqual(content.extra["media_alt_texts"], ["Slide 1", "Slide 2"])
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_pdf_dispatches_as_document_with_filename_title(self, _mock_creds, mock_get_provider):
+        engine, platform_post, mock_provider = _build_dispatch_mocks("linkedin_personal", "11111")
+        mock_provider.supported_post_types = [PostType.TEXT, PostType.IMAGE, PostType.DOCUMENT]
+        platform_post.post.media_attachments.select_related.return_value.order_by.return_value = [
+            _linkedin_attachment("carousel.pdf", "document", b"%PDF-1.7")
+        ]
+        mock_get_provider.return_value = mock_provider
+
+        engine._dispatch_to_provider(platform_post)
+
+        _token, content = mock_provider.publish_post.call_args.args
+        self.assertEqual(content.post_type, PostType.DOCUMENT)
+        self.assertEqual(content.extra["document_title"], "carousel.pdf")
+        self.assertNotIn("media_alt_texts", content.extra)
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_pdf_with_other_media_fails_instead_of_dropping_the_pdf(self, _mock_creds, mock_get_provider):
+        # A document post carries exactly one file. Before, [video, pdf] went out
+        # as a VIDEO post with the PDF silently dropped (the video path only
+        # uploads the first file), and [gif, pdf] went out as caption-only TEXT.
+        video = ("clip.mp4", "video", b"\x00\x00\x00\x18ftypmp42")
+        gif = ("anim.gif", "gif", b"GIF89a")
+        image = ("photo.jpg", "image", b"\xff\xd8\xff")
+        pdf = ("deck.pdf", "document", b"%PDF-1.7")
+        for files in ([video, pdf], [gif, pdf], [image, pdf], [pdf, image]):
+            with self.subTest(files=[f[0] for f in files]):
+                engine, platform_post, mock_provider = _build_dispatch_mocks("linkedin_company", "98765")
+                mock_provider.supported_post_types = [PostType.TEXT, PostType.IMAGE, PostType.DOCUMENT]
+                platform_post.post.media_attachments.select_related.return_value.order_by.return_value = [
+                    _linkedin_attachment(*f) for f in files
+                ]
+                mock_get_provider.return_value = mock_provider
+
+                with self.assertRaises(PublishError) as ctx:
+                    engine._dispatch_to_provider(platform_post)
+
+                self.assertFalse(ctx.exception.retryable)
+                self.assertEqual(str(ctx.exception), DOCUMENT_NOT_ALONE_MESSAGE)
+                mock_provider.publish_post.assert_not_called()
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_video_only_platform_skips_the_pdf_and_publishes_the_video(self, _mock_creds, mock_get_provider):
+        # Video-only platforms (YouTube, TikTok) drop every non-video attachment,
+        # so a cross-platform [video, pdf] post still publishes the video there
+        # instead of failing on the PDF meant for LinkedIn.
+        from providers.tiktok import TikTokProvider
+        from providers.youtube import YouTubeProvider
+
+        for platform, provider_cls in (("youtube", YouTubeProvider), ("tiktok", TikTokProvider)):
+            with self.subTest(platform=platform):
+                engine, platform_post, mock_provider = _build_dispatch_mocks(platform, "acc-1")
+                mock_provider.supported_post_types = provider_cls.supported_post_types.fget(None)
+                platform_post.post.media_attachments.select_related.return_value.order_by.return_value = [
+                    _linkedin_attachment("clip.mp4", "video", b"\x00\x00\x00\x18ftypmp42"),
+                    _linkedin_attachment("deck.pdf", "document", b"%PDF-1.7"),
+                ]
+                mock_get_provider.return_value = mock_provider
+
+                engine._dispatch_to_provider(platform_post)
+
+                _token, content = mock_provider.publish_post.call_args.args
+                self.assertEqual(content.post_type, PostType.VIDEO)
+                self.assertEqual(len(content.media_files), 1)

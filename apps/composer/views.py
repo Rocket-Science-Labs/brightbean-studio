@@ -2239,26 +2239,39 @@ def upload_media(request, workspace_id, post_id=None):
         return JsonResponse({"error": "No file provided"}, status=400)
 
     from apps.media_library.models import MediaAsset
+    from apps.media_library.validators import sniff_mime, storage_filename, validate_file
 
-    # Determine media type
-    content_type = uploaded_file.content_type or ""
-    if content_type.startswith("image/"):
-        media_type = MediaAsset.MediaType.IMAGE
-    elif content_type.startswith("video/"):
-        media_type = MediaAsset.MediaType.VIDEO
-    elif content_type == "image/gif":
-        media_type = MediaAsset.MediaType.GIF
-    else:
-        media_type = MediaAsset.MediaType.DOCUMENT
+    # Decide the type from the file's real bytes, never the client-supplied
+    # Content-Type: an HTML/SVG payload labelled image/png would otherwise be
+    # stored and served back from same-origin storage (stored XSS).
+    file_type, errors = validate_file(uploaded_file)
+    if errors:
+        return JsonResponse({"error": " ".join(errors)}, status=400)
+
+    # GIFs stay IMAGE here, as before: the publisher treats media_type "image"
+    # as an image post and has no branch for "gif".
+    media_type = {
+        "image": MediaAsset.MediaType.IMAGE,
+        "gif": MediaAsset.MediaType.IMAGE,
+        "video": MediaAsset.MediaType.VIDEO,
+        "document": MediaAsset.MediaType.DOCUMENT,
+    }[file_type]
+
+    # Store under the extension the sniffed bytes justify, as create_asset does:
+    # the served Content-Type comes from the suffix, so "poc.html" must not
+    # survive as a key. ``filename`` keeps the uploader's name for display.
+    sniffed_mime = sniff_mime(uploaded_file) or ""
+    display_name = uploaded_file.name
+    uploaded_file.name = storage_filename(display_name, sniffed_mime)
 
     asset = MediaAsset.objects.create(
         organization=workspace.organization,
         workspace=workspace,
         uploaded_by=request.user,
         file=uploaded_file,
-        filename=uploaded_file.name,
+        filename=display_name,
         media_type=media_type,
-        mime_type=content_type,
+        mime_type=sniffed_mime,
         file_size=uploaded_file.size,
         source="upload",
     )

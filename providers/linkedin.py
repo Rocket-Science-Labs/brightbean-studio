@@ -52,6 +52,21 @@ LINKEDIN_HEADERS = {
     "X-Restli-Protocol-Version": "2.0.0",
 }
 
+# Documented limits for organic multi-image and document posts.
+# https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/multiimage-post-api
+# https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/images-api
+# https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/documents-api
+MULTI_IMAGE_MIN = 2
+MULTI_IMAGE_MAX = 20
+IMAGE_MAX_PIXELS = 36_152_320
+IMAGE_FORMATS = {"JPEG", "PNG", "GIF"}
+GIF_MAX_FRAMES = 250
+ALT_TEXT_MAX_LENGTH = 4086
+DOCUMENT_MAX_BYTES = 100 * 1024 * 1024
+# LinkedIn also caps documents at 300 pages. That is not checked here: counting
+# pages reliably needs a PDF parser and none is a dependency, so an over-long PDF
+# is caught by LinkedIn's processing and surfaces as PROCESSING_FAILED.
+
 
 def _encode_urn(urn: str) -> str:
     """Percent-encode a LinkedIn URN for use as a URL path segment.
@@ -116,6 +131,8 @@ class LinkedInProvider(SocialProvider):
         return [
             PostType.TEXT,
             PostType.IMAGE,
+            PostType.MULTI_IMAGE,
+            PostType.DOCUMENT,
             PostType.VIDEO,
             PostType.LINK,
             PostType.ARTICLE,
@@ -124,7 +141,7 @@ class LinkedInProvider(SocialProvider):
 
     @property
     def supported_media_types(self) -> list[MediaType]:
-        return [MediaType.JPEG, MediaType.PNG, MediaType.GIF, MediaType.MP4]
+        return [MediaType.JPEG, MediaType.PNG, MediaType.GIF, MediaType.MP4, MediaType.PDF]
 
     @property
     def required_scopes(self) -> list[str]:
@@ -251,6 +268,14 @@ class LinkedInProvider(SocialProvider):
             profile = self.get_profile(access_token)
             author = f"urn:li:person:{profile.platform_id}"
 
+        has_media = bool(content.media_files or content.media_urls)
+        # CAROUSEL is accepted as an alias: LinkedIn has no organic carousel, and
+        # without this a {"post_type": "carousel"} hint published a text-only post
+        # with every image dropped.
+        if content.post_type in (PostType.MULTI_IMAGE, PostType.CAROUSEL) and has_media:
+            return self._publish_multi_image_post(access_token, author, content)
+        if content.post_type == PostType.DOCUMENT and has_media:
+            return self._publish_document_post(access_token, author, content)
         if content.post_type == PostType.IMAGE and (content.media_files or content.media_urls):
             return self._publish_image_post(access_token, author, content)
         if content.post_type == PostType.VIDEO and (content.media_files or content.media_urls):
@@ -349,6 +374,116 @@ class LinkedInProvider(SocialProvider):
             platform_post_id=post_urn,
             url=self._post_urn_to_url(post_urn),
             extra={"urn": post_urn, "image_urn": image_urn},
+        )
+
+    def _publish_multi_image_post(self, access_token: str, author: str, content: PublishContent) -> PublishResult:
+        """Publish 2-20 images as one organic multi-image post.
+
+        Every image is checked against LinkedIn's limits before anything is
+        uploaded, so a bad image 5 doesn't leave images 1-4 orphaned. Then each
+        image gets its own initializeUpload + PUT (there is no batch initialize),
+        and the post references the image URNs in order.
+        """
+        sources = list(content.media_files or content.media_urls)
+        if not MULTI_IMAGE_MIN <= len(sources) <= MULTI_IMAGE_MAX:
+            raise PublishError(
+                f"LinkedIn multi-image posts need {MULTI_IMAGE_MIN} to {MULTI_IMAGE_MAX} images; got {len(sources)}.",
+                platform=self.platform_name,
+                retryable=False,
+            )
+        alt_texts = list(content.extra.get("media_alt_texts") or [])
+        for index, source in enumerate(sources, start=1):
+            self._check_image_limits(source, index)
+            alt = alt_texts[index - 1] if index <= len(alt_texts) else ""
+            if alt and len(alt) > ALT_TEXT_MAX_LENGTH:
+                raise PublishError(
+                    f"Alt text for image {index} is {len(alt)} characters; LinkedIn allows {ALT_TEXT_MAX_LENGTH}.",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+
+        images: list[dict] = []
+        for index, source in enumerate(sources, start=1):
+            upload_url, image_urn = self._initialize_upload(access_token, "images", "image", author)
+            self._upload_binary(access_token, upload_url, source)
+            image: dict = {"id": image_urn}
+            alt = alt_texts[index - 1] if index <= len(alt_texts) else ""
+            if alt:
+                image["altText"] = alt
+            images.append(image)
+
+        body = self._build_post_body(author, content.text)
+        body["content"] = {"multiImage": {"images": images}}
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/rest/posts",
+            access_token=access_token,
+            headers=LINKEDIN_HEADERS,
+            json=body,
+        )
+        post_urn = resp.headers.get("x-restli-id", "")
+        return PublishResult(
+            platform_post_id=post_urn,
+            url=self._post_urn_to_url(post_urn),
+            extra={"urn": post_urn, "image_urns": [img["id"] for img in images]},
+        )
+
+    def _publish_document_post(self, access_token: str, author: str, content: PublishContent) -> PublishResult:
+        """Publish one PDF as an organic document post (LinkedIn's swipeable viewer).
+
+        Documents API: initializeUpload -> PUT the bytes -> poll until AVAILABLE
+        -> create the post with content.media {id, title}. LinkedIn's post schema
+        marks media.title as required for documents, so it is always sent.
+        """
+        sources = list(content.media_files or content.media_urls)
+        if len(sources) != 1:
+            raise PublishError(
+                f"A LinkedIn document post takes exactly one PDF; got {len(sources)} files. "
+                "Remove the other media or post them separately.",
+                platform=self.platform_name,
+                retryable=False,
+            )
+        source = sources[0]
+        title = (content.title or content.extra.get("document_title") or "").strip()
+        if not title:
+            title = os.path.basename(source.split("?", 1)[0]) or "Document.pdf"
+
+        # One bounded handle for both the checks and the PUT, so a URL source is
+        # fetched once and the PDF is never held in memory as bytes.
+        with self._media_handle(source, max_bytes=DOCUMENT_MAX_BYTES) as media:
+            if not media.read(5).startswith(b"%PDF-"):
+                raise PublishError(
+                    "LinkedIn document posts need a PDF file; this attachment is not a PDF.",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+            size = os.fstat(media.fileno()).st_size
+            if size > DOCUMENT_MAX_BYTES:
+                raise PublishError(
+                    f"The PDF is {size / (1024 * 1024):.1f} MB; LinkedIn allows up to 100 MB.",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+            media.seek(0)
+
+            upload_url, document_urn = self._initialize_upload(access_token, "documents", "document", author)
+            self._put_media(access_token, upload_url, media)
+        self._wait_for_media_available(access_token, document_urn, resource="documents", label="document")
+
+        body = self._build_post_body(author, content.text)
+        body["content"] = {"media": {"title": title, "id": document_urn}}
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/rest/posts",
+            access_token=access_token,
+            headers=LINKEDIN_HEADERS,
+            json=body,
+        )
+        post_urn = resp.headers.get("x-restli-id", "")
+        return PublishResult(
+            platform_post_id=post_urn,
+            url=self._post_urn_to_url(post_urn),
+            extra={"urn": post_urn, "document_urn": document_urn},
         )
 
     def _publish_video_post(self, access_token: str, author: str, content: PublishContent) -> PublishResult:
@@ -728,16 +863,20 @@ class LinkedInProvider(SocialProvider):
         is an unbounded read straight into the worker's heap.
         """
         with self._media_handle(source) as media:
-            with httpx.Client(timeout=120.0) as client:
-                upload_resp = client.put(
-                    upload_url,
-                    content=media,
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "Content-Type": "application/octet-stream",
-                        **LINKEDIN_HEADERS,
-                    },
-                )
+            self._put_media(access_token, upload_url, media)
+
+    def _put_media(self, access_token: str, upload_url: str, media) -> None:
+        """PUT an open media file object to a LinkedIn uploadUrl (images and documents)."""
+        with httpx.Client(timeout=120.0) as client:
+            upload_resp = client.put(
+                upload_url,
+                content=media,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/octet-stream",
+                    **LINKEDIN_HEADERS,
+                },
+            )
             if upload_resp.status_code >= 400:
                 raise PublishError(
                     f"LinkedIn media upload failed: {upload_resp.status_code}",
@@ -745,15 +884,88 @@ class LinkedInProvider(SocialProvider):
                     raw_response=self._safe_json(upload_resp),
                 )
 
+    def _initialize_upload(self, access_token: str, resource: str, urn_key: str, owner: str) -> tuple[str, str]:
+        """Call /rest/{resource}?action=initializeUpload; return (uploadUrl, asset URN)."""
+        init_resp = self._request(
+            "POST",
+            f"{API_BASE}/rest/{resource}",
+            access_token=access_token,
+            headers=LINKEDIN_HEADERS,
+            params={"action": "initializeUpload"},
+            json={"initializeUploadRequest": {"owner": owner}},
+        )
+        init_data = init_resp.json().get("value", {})
+        upload_url = init_data.get("uploadUrl", "")
+        urn = init_data.get(urn_key, "")
+        if not upload_url or not urn:
+            raise PublishError(
+                f"Failed to initialize LinkedIn {urn_key} upload",
+                platform=self.platform_name,
+                raw_response=init_data,
+            )
+        return upload_url, urn
+
+    def _check_image_limits(self, source: str, index: int) -> None:
+        """Reject an image LinkedIn would refuse: not JPG/PNG/GIF, too many pixels, or a GIF over 250 frames.
+
+        Pillow reads only the header here, not the whole image. A URL goes
+        through the same bounded ``_media_handle`` the upload uses.
+        """
+        from PIL import Image, UnidentifiedImageError
+
+        try:
+            with self._media_handle(source) as fp, Image.open(fp) as img:
+                fmt = img.format
+                width, height = img.size
+                frames = getattr(img, "n_frames", 1)
+        except Image.DecompressionBombError as exc:
+            # Pillow refuses to open images far above its own pixel threshold;
+            # that is a too-big image, not a wrong format.
+            raise PublishError(
+                f"Image {index} has too many pixels; LinkedIn needs fewer than {IMAGE_MAX_PIXELS:,} pixels.",
+                platform=self.platform_name,
+                retryable=False,
+            ) from exc
+        except (UnidentifiedImageError, OSError) as exc:
+            raise PublishError(
+                f"Image {index} is not a JPG, PNG or GIF that LinkedIn can accept.",
+                platform=self.platform_name,
+                retryable=False,
+            ) from exc
+        # Phone cameras write JPEGs with an embedded second image (Multi-Picture
+        # Format); Pillow names that "MPO", but the file is a JPEG.
+        if fmt == "MPO":
+            fmt = "JPEG"
+        if fmt not in IMAGE_FORMATS:
+            raise PublishError(
+                f"Image {index} is {fmt}; LinkedIn multi-image posts accept JPG, PNG or GIF.",
+                platform=self.platform_name,
+                retryable=False,
+            )
+        if width * height >= IMAGE_MAX_PIXELS:
+            raise PublishError(
+                f"Image {index} is {width}x{height}; LinkedIn needs fewer than {IMAGE_MAX_PIXELS:,} pixels.",
+                platform=self.platform_name,
+                retryable=False,
+            )
+        if fmt == "GIF" and frames > GIF_MAX_FRAMES:
+            raise PublishError(
+                f"GIF {index} has {frames} frames; LinkedIn allows up to {GIF_MAX_FRAMES}.",
+                platform=self.platform_name,
+                retryable=False,
+            )
+
     @staticmethod
     @contextlib.contextmanager
-    def _media_handle(source: str):
+    def _media_handle(source: str, max_bytes: int | None = None):
         """Yield an open, readable file object for a local path or HTTP(S) URL.
 
         The URL branch is bounded. A local path is something we put there and
         already size-checked at upload; a URL is supplied by the caller and has
         no size we control, so streaming it unchecked just moves an unbounded
-        read from the heap onto the dyno's shared ephemeral disk.
+        read from the heap onto the dyno's shared ephemeral disk. The bound is
+        ``max_bytes``, defaulting to ``MAX_REMOTE_MEDIA_BYTES``; document posts
+        pass LinkedIn's larger document limit.
         """
         if not source.startswith(("http://", "https://")):
             with open(source, "rb") as f:
@@ -763,7 +975,7 @@ class LinkedInProvider(SocialProvider):
         with tempfile.NamedTemporaryFile(suffix=".linkedin-media") as spool:
             with httpx.Client(timeout=120.0) as client, client.stream("GET", source) as resp:
                 resp.raise_for_status()
-                LinkedInProvider._reject_oversize(resp.headers.get("Content-Length"))
+                LinkedInProvider._reject_oversize(resp.headers.get("Content-Length"), max_bytes)
 
                 written = 0
                 for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
@@ -771,24 +983,26 @@ class LinkedInProvider(SocialProvider):
                     # Checked per chunk as well as up front: Content-Length is
                     # the server's claim, not a guarantee, and it is absent
                     # entirely on a chunked response.
-                    LinkedInProvider._reject_oversize(written)
+                    LinkedInProvider._reject_oversize(written, max_bytes)
                     spool.write(chunk)
             spool.flush()
             spool.seek(0)
             yield spool
 
     @staticmethod
-    def _reject_oversize(size) -> None:
+    def _reject_oversize(size, max_bytes: int | None = None) -> None:
         """Raise if ``size`` exceeds the remote-media ceiling. None is ignored."""
         if size is None:
             return
+        if max_bytes is None:
+            max_bytes = MAX_REMOTE_MEDIA_BYTES
         try:
             size = int(size)
         except (TypeError, ValueError):
             return
-        if size > MAX_REMOTE_MEDIA_BYTES:
+        if size > max_bytes:
             raise PublishError(
-                f"Remote media exceeds the {MAX_REMOTE_MEDIA_BYTES // (1024 * 1024)}MB limit.",
+                f"Remote media exceeds the {max_bytes // (1024 * 1024)}MB limit.",
                 platform="linkedin",
                 # Deterministic: the file at that URL will be the same size on
                 # every attempt. Without this the engine schedules the full
@@ -875,12 +1089,36 @@ class LinkedInProvider(SocialProvider):
         400 MEDIA_ASSET_WAITING_UPLOAD or MEDIA_ASSET_PROCESSING_FAILED — see
         https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/videos-api#api-error-details
         """
+        self._wait_for_media_available(
+            access_token,
+            video_urn,
+            resource="videos",
+            label="video",
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+        )
+
+    def _wait_for_media_available(
+        self,
+        access_token: str,
+        urn: str,
+        *,
+        resource: str,
+        label: str,
+        timeout_seconds: float = 180.0,
+        poll_interval: float = 3.0,
+    ) -> None:
+        """Poll GET /rest/{resource}/{urn} until status is AVAILABLE.
+
+        Videos and documents share the same status lifecycle:
+        WAITING_UPLOAD -> PROCESSING -> AVAILABLE | PROCESSING_FAILED.
+        """
         deadline = time.monotonic() + timeout_seconds
         last_status: str | None = None
         while True:
             resp = self._request(
                 "GET",
-                f"{API_BASE}/rest/videos/{_encode_urn(video_urn)}",
+                f"{API_BASE}/rest/{resource}/{_encode_urn(urn)}",
                 access_token=access_token,
                 headers=LINKEDIN_HEADERS,
             )
@@ -890,7 +1128,7 @@ class LinkedInProvider(SocialProvider):
                 return
             if status == "PROCESSING_FAILED":
                 raise PublishError(
-                    f"LinkedIn rejected the video during processing: "
+                    f"LinkedIn rejected the {label} during processing: "
                     f"{data.get('processingFailureReason', 'unknown reason')}",
                     platform=self.platform_name,
                     raw_response=data,
@@ -898,7 +1136,7 @@ class LinkedInProvider(SocialProvider):
             last_status = status
             if time.monotonic() >= deadline:
                 raise PublishError(
-                    f"Timed out waiting for LinkedIn video to become AVAILABLE (last status: {last_status})",
+                    f"Timed out waiting for LinkedIn {label} to become AVAILABLE (last status: {last_status})",
                     platform=self.platform_name,
                 )
             time.sleep(poll_interval)

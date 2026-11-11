@@ -12,6 +12,8 @@ Context: pending_assets, workspace.
             <svg class="w-2.5 h-2.5 text-white ml-px" fill="currentColor" viewBox="0 0 20 20"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/></svg>
         </div>
     </div>
+    {% elif asset.media_type == "document" %}
+    <div class="w-full h-full bg-stone-100 flex items-center justify-center text-[10px] font-semibold text-stone-500" data-media-type="document" title="{{ asset.filename }}">PDF</div>
     {% elif asset.file %}
     <img src="{{ asset.file.url }}" alt="{{ asset.filename }}">
     {% else %}

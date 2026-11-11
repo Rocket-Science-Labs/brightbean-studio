@@ -68,8 +68,20 @@ MAX_FILE_SIZES = {
     "image": getattr(settings, "MEDIA_LIBRARY_MAX_IMAGE_SIZE", 20 * 1024 * 1024),
     "gif": getattr(settings, "MEDIA_LIBRARY_MAX_IMAGE_SIZE", 20 * 1024 * 1024),
     "video": getattr(settings, "MEDIA_LIBRARY_MAX_VIDEO_SIZE", 1024 * 1024 * 1024),
-    "document": getattr(settings, "MEDIA_LIBRARY_MAX_IMAGE_SIZE", 20 * 1024 * 1024),
+    "document": getattr(settings, "MEDIA_LIBRARY_MAX_DOCUMENT_SIZE", 100 * 1024 * 1024),
 }
+
+# Formats we can recognise but deliberately don't accept, with advice the user
+# can act on. LinkedIn and Instagram's publishing APIs take neither.
+UNSUPPORTED_MIME_MESSAGES = {
+    "image/heic": "HEIC/HEIF photos aren't supported. Export the photo as JPG or PNG and upload it again.",
+    "image/avif": "AVIF images aren't supported. Export the image as JPG or PNG and upload it again.",
+}
+
+# ISO Base Media (ftyp) major brands that are still images, not video.
+# iPhones save photos as HEIC, which shares MP4's container.
+_HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}
+_AVIF_BRANDS = {b"avif", b"avis"}
 
 
 def determine_file_type(mime_type):
@@ -141,9 +153,14 @@ def sniff_mime(file_obj):
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "image/webp"
     if head[4:8] == b"ftyp":
-        # ISO Base Media: covers MP4, MOV/QuickTime, M4V. Brand-sniffing would
-        # let us split mov from mp4, but our allow-list treats both as video.
+        # ISO Base Media: covers MP4, MOV/QuickTime, M4V, and also HEIC/HEIF
+        # and AVIF still images. The major brand tells them apart; any brand
+        # not listed as an image stays video, as before.
         brand = head[8:12]
+        if brand in _HEIF_BRANDS:
+            return "image/heic"
+        if brand in _AVIF_BRANDS:
+            return "image/avif"
         if brand in (b"qt  ",):
             return "video/quicktime"
         return "video/mp4"
@@ -166,6 +183,9 @@ def validate_file(uploaded_file):
     errors = []
 
     sniffed = sniff_mime(uploaded_file)
+    if sniffed in UNSUPPORTED_MIME_MESSAGES:
+        errors.append(UNSUPPORTED_MIME_MESSAGES[sniffed])
+        return None, errors
     if not sniffed or sniffed not in ALL_ALLOWED_MIMES:
         # Reject. We do not echo back the client-supplied content_type because
         # that's misleading when the magic doesn't match.
