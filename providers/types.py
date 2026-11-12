@@ -29,6 +29,10 @@ class PostType(enum.Enum):
     IMAGE = "image"
     VIDEO = "video"
     CAROUSEL = "carousel"
+    # LinkedIn organic posts: 2-20 images shown as a gallery (content.multiImage),
+    # and a single PDF shown as a swipeable document (content.media + urn:li:document).
+    MULTI_IMAGE = "multi_image"
+    DOCUMENT = "document"
     STORY = "story"
     REEL = "reel"
     LINK = "link"

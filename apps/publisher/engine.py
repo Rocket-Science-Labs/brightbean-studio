@@ -46,7 +46,7 @@ from apps.social_accounts.error_messages import (
     friendly_publish_error,
 )
 from providers import get_provider
-from providers.exceptions import ProviderError, RateLimitError
+from providers.exceptions import ProviderError, PublishError, RateLimitError
 from providers.types import PostType, PublishContent, PublishState
 
 from .models import PublishLog, RateLimitState
@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 
 # Retry backoff schedule (in seconds)
 RETRY_BACKOFF = [60, 300, 1800]  # 1min, 5min, 30min
+
+DOCUMENT_UNSUPPORTED_MESSAGE = "PDF documents can only be published to LinkedIn. Remove the PDF or this account."
+DOCUMENT_NOT_ALONE_MESSAGE = (
+    "A PDF must be the only file on a post. Remove the other media, or post the PDF on its own."
+)
 
 
 def _resolve_publish_credentials(account):
@@ -718,10 +723,25 @@ class PublishEngine:
             media_cache = _SharedMediaCache()
         attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
 
-        # For video-only platforms (YouTube, TikTok), skip non-video attachments
+        # For video-only platforms (YouTube, TikTok), skip non-video attachments.
+        # This runs before the document checks so a cross-platform post with a
+        # video and a PDF still publishes the video here.
         video_only = set(provider.supported_post_types) <= {PostType.VIDEO, PostType.SHORT}
         if video_only:
             attachments = [pm for pm in attachments if pm.media_asset.media_type == "video"]
+
+        # A PDF on a platform without document posts used to resolve to TEXT and
+        # publish the caption alone. Fail it instead, before any download.
+        if PostType.DOCUMENT not in provider.supported_post_types and any(
+            pm.media_asset.media_type == "document" for pm in attachments
+        ):
+            raise PublishError(DOCUMENT_UNSUPPORTED_MESSAGE, platform=platform, retryable=False)
+        # A document post carries exactly one file. A PDF next to other media
+        # would otherwise resolve to another post type (a video first went out as
+        # VIDEO) and the PDF would be dropped without a word. The composer blocks
+        # this in the UI; the API and MCP paths reach here unchecked.
+        if len(attachments) > 1 and any(pm.media_asset.media_type == "document" for pm in attachments):
+            raise PublishError(DOCUMENT_NOT_ALONE_MESSAGE, platform=platform, retryable=False)
 
         # Providers that publish from a hosted URL never read ``media_files``,
         # so pulling the bytes down for them is pure cost — and on a small dyno
@@ -730,6 +750,11 @@ class PublishEngine:
         needs_local_media = provider.needs_local_media
 
         first_media_type = None
+        first_media_filename = None
+        # Alt text per usable attachment, index-aligned with media_urls (and with
+        # media_files when the provider needs local media) so providers that
+        # accept per-image alt text (LinkedIn multiImage) can use it.
+        media_alt_texts = []
         primary_video_duration = None
         usable_attachments = 0
         app_url = getattr(settings, "APP_URL", "").rstrip("/")
@@ -742,6 +767,7 @@ class PublishEngine:
                 # Track the first media type for post type detection
                 if first_media_type is None:
                     first_media_type = asset.media_type
+                    first_media_filename = asset.filename
 
                 # Capture the first video's duration so providers can enforce
                 # platform max-duration limits (e.g. TikTok max_video_post_duration_sec).
@@ -755,6 +781,8 @@ class PublishEngine:
                     url = f"{app_url}{url}"
                 media_urls.append(url)
                 media_types.append(asset.media_type)
+
+                media_alt_texts.append(asset.alt_text or "")
 
                 if needs_local_media:
                     media_files.append(media_cache.path_for(asset))
@@ -822,6 +850,13 @@ class PublishEngine:
                 media_count=usable_attachments,
                 first_media_type=first_media_type,
             )
+
+            if post_type == PostType.MULTI_IMAGE and "media_alt_texts" not in extra:
+                extra["media_alt_texts"] = media_alt_texts
+            # LinkedIn requires a title on document posts; the original filename
+            # is the fallback when the post has no title of its own.
+            if post_type == PostType.DOCUMENT and "document_title" not in extra:
+                extra["document_title"] = first_media_filename or ""
 
             content = PublishContent(
                 text=platform_post.effective_caption or "",
@@ -896,12 +931,18 @@ class PublishEngine:
 
         Priority:
         1. Explicit hint in platform_extra (validated against PostType enum,
-           and against the media actually attached right now)
+           and against the media actually attached right now; "carousel" on
+           LinkedIn becomes MULTI_IMAGE)
         2. Platform defaults (Pinterest → PIN)
         3. Multi-media on carousel-capable platforms → CAROUSEL
-        4. Fallback: video → VIDEO (REEL on Instagram), image → IMAGE, else → TEXT
+        4. LinkedIn: a document (PDF) → DOCUMENT; more than one image (or GIF)
+           → MULTI_IMAGE (LinkedIn has no organic carousel, so these are its two
+           multi-page formats)
+        5. Fallback: video → VIDEO (REEL on Instagram), image → IMAGE, else → TEXT
         """
-        # 1. Explicit post_type hint from platform_extra
+        # 1. Explicit post_type hint from platform_extra. LinkedIn has no organic
+        #    carousel, so a "carousel" hint there means its multi-image post
+        #    (which also carries the per-image alt text).
         hint = platform_extra.get("post_type")
         if hint:
             valid_values = {pt.value for pt in PostType}
@@ -915,6 +956,8 @@ class PublishEngine:
                     first_media_type,
                 )
             else:
+                if hint == PostType.CAROUSEL.value and platform in ("linkedin_personal", "linkedin_company"):
+                    return PostType.MULTI_IMAGE
                 return PostType(hint)
 
         # 2. Platform defaults
@@ -929,7 +972,17 @@ class PublishEngine:
         ):
             return PostType.CAROUSEL
 
-        # 4. Fallback based on first media type
+        # 4. LinkedIn document and multi-image posts. _dispatch_to_provider has
+        #    already rejected a PDF mixed with other media; the provider checks
+        #    the rest (2-20 images, each a JPG, PNG or GIF) with clear errors.
+        #    Media-library, API and MCP uploads store GIFs as "gif", not "image".
+        if platform in ("linkedin_personal", "linkedin_company"):
+            if first_media_type == "document":
+                return PostType.DOCUMENT
+            if media_count > 1 and first_media_type in ("image", "gif"):
+                return PostType.MULTI_IMAGE
+
+        # 5. Fallback based on first media type
         if first_media_type == "video":
             # Instagram has no standalone feed video — a lone video is a Reel.
             # Resolving that here keeps the platform rule next to the other

@@ -522,7 +522,7 @@
                         <!-- Media row: dropzone tile + Unsplash tile + attached thumbnails -->
                         <div class="flex flex-wrap items-start gap-2 px-4 pb-3">
                             <input type="file" x-ref="fileInput" class="hidden" multiple
-                                   accept="image/*,video/*"
+                                   accept="image/*,video/*,application/pdf"
                                    @change="handleFileSelect($event)">
                             <div class="media-dropzone-inline"
                                  @dragover.prevent="$el.classList.add('dragover')"
@@ -2749,6 +2749,33 @@ function composerApp() {
         processFiles(files) {
             const videos = files.filter(f => f.type.startsWith('video/'));
             const images = files.filter(f => f.type.startsWith('image/'));
+            const pdfs = files.filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
+            const mediaList = document.getElementById('media-list');
+            const attachedCount = mediaList ? mediaList.querySelectorAll('.media-thumb').length : 0;
+            const attachedPdf = mediaList ? mediaList.querySelectorAll('[data-media-type="document"]').length : 0;
+
+            // A PDF becomes a LinkedIn document post, which carries exactly one
+            // file: never several PDFs, and never a PDF next to images or video.
+            if (pdfs.length > 0 && (files.length > 1 || attachedCount > 0)) {
+                alert('A PDF must be the only file on a post. Remove the other media, or upload one PDF on its own.');
+                return;
+            }
+            if (attachedPdf > 0) {
+                alert('This post already has a PDF. Remove it before adding images or video.');
+                return;
+            }
+            // Only LinkedIn publishes PDFs; on any other account the post fails.
+            // Warn now rather than at publish time, but still upload: the user
+            // may be about to deselect those accounts.
+            if (pdfs.length > 0) {
+                const nonLinkedIn = this.selectedAccounts
+                    .map(id => this.charLimits[id])
+                    .filter(c => c && !c.platform.startsWith('linkedin'))
+                    .map(c => c.name || c.platform);
+                if (nonLinkedIn.length > 0) {
+                    alert('PDF documents can only be published to LinkedIn. Remove the PDF or deselect: ' + nonLinkedIn.join(', ') + '.');
+                }
+            }
 
             if (videos.length > 1) {
                 alert('Only one video file can be uploaded at a time.');
