@@ -47,7 +47,7 @@ def _message(account, *, message_type, hours_ago=1, extra=None, sender_handle="p
         sender_name="Marta",
         sender_handle=sender_handle,
         body="Question?",
-        extra=extra or {},
+        extra={"platform_timestamp": (timezone.now() - timedelta(hours=hours_ago)).isoformat(), **(extra or {})},
         received_at=timezone.now() - timedelta(hours=hours_ago),
     )
 
@@ -104,7 +104,7 @@ def test_providers_without_a_comment_edge_alias_reply_to_comment():
         provider.reply_to_message.assert_called_once_with("token", "comment-1", "Thanks!", {"k": "v"})
 
 
-def test_a_provider_that_cannot_reply_records_the_reply_locally(client, fb_account, org_owner, user):
+def test_a_meta_provider_that_cannot_reply_keeps_a_failed_draft(client, fb_account, org_owner, user):
     """Losing the platform call must not lose the team's written answer."""
     from apps.members.models import WorkspaceMembership
 
@@ -121,9 +121,9 @@ def test_a_provider_that_cannot_reply_records_the_reply_locally(client, fb_accou
         )
 
     assert response.status_code == 200
-    assert "HX-Reply-Failed" not in response
+    assert response["HX-Reply-Failed"] == "1"
     reply = InboxReply.objects.get(inbox_message=message)
-    assert reply.status == InboxReply.Status.SENT
+    assert reply.status == InboxReply.Status.FAILED
     assert reply.platform_reply_id == ""
 
 
@@ -183,12 +183,15 @@ def test_recent_dm_replies_without_the_human_agent_tag(fb_account):
     assert provider.reply_to_message.call_args.kwargs["human_agent"] is False
 
 
-def test_dm_older_than_24_hours_is_tagged_human_agent(fb_account):
+def test_dm_older_than_24_hours_needs_a_human_and_approval(fb_account, user):
     message = _message(fb_account, message_type=InboxMessage.MessageType.DM, hours_ago=30)
     provider = _provider()
 
-    with patch("apps.inbox.services.get_provider", return_value=provider):
-        _dispatch_to_platform(message, "Sorry for the delay")
+    with (
+        patch("apps.inbox.services.get_provider", return_value=provider),
+        patch("apps.publisher.engine._resolve_publish_credentials", return_value={"human_agent_enabled": True}),
+    ):
+        _dispatch_to_platform(message, "Sorry for the delay", origin="web_inbox", actor=user)
 
     assert provider.reply_to_message.call_args.kwargs["human_agent"] is True
 
@@ -237,7 +240,7 @@ def test_failed_send_records_no_reply(client, fb_account, org_owner, user):
     assert response.status_code == 200
     assert response["HX-Reply-Failed"] == "1"
     assert b"Reply not sent" in response.content
-    assert InboxReply.objects.filter(inbox_message=message).count() == 0
+    assert InboxReply.objects.get(inbox_message=message).status == InboxReply.Status.FAILED
     # Status is untouched, so the message stays in the queue to be answered.
     message.refresh_from_db()
     assert message.status == InboxMessage.Status.UNREAD

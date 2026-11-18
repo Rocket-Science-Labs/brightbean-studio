@@ -121,6 +121,7 @@ class DevtoProvider(SocialProvider):
             raise PublishError(
                 "DEV.to requires a title. Set the post title before publishing.",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         body = content.description or content.text or ""

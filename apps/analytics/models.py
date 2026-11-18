@@ -42,6 +42,23 @@ class AccountInsightsSnapshot(models.Model):
         return f"{self.social_account_id} · {self.metric_key} · {self.date} = {self.value}"
 
 
+class YouTubePeriodReport(models.Model):
+    """Native channel totals returned for an exact YouTube reporting window."""
+
+    social_account = models.ForeignKey(
+        "social_accounts.SocialAccount", on_delete=models.CASCADE, related_name="youtube_period_reports"
+    )
+    start_date = models.DateField()
+    end_date = models.DateField()
+    metrics = models.JSONField(default=dict)
+    captured_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["social_account", "start_date", "end_date"], name="youtube_period_unique")
+        ]
+
+
 class PostInsightsSnapshot(models.Model):
     """One row per (platform_post, metric, day) — daily history per post.
 
@@ -90,8 +107,9 @@ class ProviderQuotaBlock(models.Model):
     ``quota_scope`` separates budgets the same platform meters independently —
     YouTube's Data API and Analytics API have separate quotas, and blocking the
     cheap batched Analytics call because the Data API ran dry would throw away
-    the part of the sync that was never the problem. Empty for platforms with a
-    single pool.
+    the part of the sync that was never the problem. ``videos.insert`` has a
+    third, "upload", since YouTube gave it its own bucket. Empty for platforms
+    with a single pool.
 
     Deliberately not ``apps.publisher.models.RateLimitState``: that table is
     read by the publish engine as a hard gate on *publishing*, so writing a

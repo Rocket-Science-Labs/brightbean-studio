@@ -1,7 +1,6 @@
 """Background tasks for social account health checks."""
 
 import logging
-from datetime import timedelta
 
 from background_task import background
 from django.utils import timezone
@@ -21,6 +20,16 @@ EXPIRY_BOOTSTRAP_PLATFORMS = ("bluesky", "threads")
 
 @background(schedule=0)
 def check_social_account_health(account_id: str):
+    """Maintain account health without scheduling historical analytics work."""
+    from apps.analytics.signals import suppress_analytics_backfills
+
+    # Some platform-specific checks reload the account before saving tokens.
+    # An instance flag alone does not cover those saves; a scoped guard does.
+    with suppress_analytics_backfills():
+        _check_social_account_health(account_id)
+
+
+def _check_social_account_health(account_id: str):
     """Check health of a single social account.
 
     Validates the OAuth token by calling get_profile(). If the token
@@ -35,6 +44,14 @@ def check_social_account_health(account_id: str):
         account = SocialAccount.objects.get(id=account_id)
     except SocialAccount.DoesNotExist:
         logger.warning("Health check: account %s not found, skipping", account_id)
+        return
+
+    if account.platform == "youtube":
+        from django.conf import settings
+
+        from .youtube_compliance import check_connection
+
+        check_connection(account, enforce=settings.YOUTUBE_COMPLIANCE_ENFORCEMENT)
         return
 
     # Resolve per-account credentials via the shared resolver: org/.env app creds
@@ -62,13 +79,7 @@ def check_social_account_health(account_id: str):
     needs_expiry_bootstrap = account.platform in EXPIRY_BOOTSTRAP_PLATFORMS and account.token_expires_at is None
     if (account.is_token_expiring_soon or needs_expiry_bootstrap) and account.oauth_refresh_token:
         try:
-            new_tokens = provider.refresh_token(account.oauth_refresh_token)
-            account.oauth_access_token = new_tokens.access_token
-            if new_tokens.refresh_token:
-                account.oauth_refresh_token = new_tokens.refresh_token
-            if new_tokens.expires_in:
-                account.token_expires_at = timezone.now() + timedelta(seconds=new_tokens.expires_in)
-            account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
+            account.refresh_oauth_token(provider, enqueue_backfill=False)
             account.last_error = ""
             logger.info("Health check: refreshed token for %s", account)
         except Exception as e:
@@ -79,12 +90,11 @@ def check_social_account_health(account_id: str):
     # A block already recorded means the platform has told us it will refuse
     # until the window rolls over. Probing anyway spends a unit from the very
     # budget that is exhausted — and on YouTube that budget is also what
-    # publishing and reconnecting draw on, so the probe competes with the
-    # recovery it is trying to detect.
+    # reconnecting draws on, so the probe competes with the recovery it is
+    # trying to detect.
     #
-    # Skipped rather than returned early: a refresh may have just rotated this
-    # account's token, and that belongs in the save below whether or not we got
-    # to ask the platform how it is doing. The refresh itself is unaffected —
+    # Skipped rather than returned early so the card records the quota block.
+    # Any refreshed token is already saved. The refresh itself is unaffected —
     # Google meters the token endpoint separately from the Data API.
     #
     # ``read_scope`` rather than a literal, so this, the inbox poll and the
@@ -148,21 +158,23 @@ def check_social_account_health(account_id: str):
             account.last_error = friendly_health_check_error(e)
 
     account.last_health_check_at = timezone.now()
-    account.save(
-        update_fields=[
-            "oauth_access_token",
-            "oauth_refresh_token",
-            "token_expires_at",
-            "follower_count",
-            "avatar_url",
-            "account_name",
-            "account_handle",
-            "connection_status",
-            "last_error",
-            "last_health_check_at",
-            "updated_at",
-        ]
-    )
+    fields = [
+        "follower_count",
+        "avatar_url",
+        "account_name",
+        "account_handle",
+        "connection_status",
+        "last_error",
+        "last_health_check_at",
+        "updated_at",
+    ]
+    # Tokens were saved inside the shared refresh lock. Saving only metadata
+    # here preserves any publisher refresh that happened during get_profile.
+    account._skip_analytics_backfill = True
+    try:
+        account.save(update_fields=fields)
+    finally:
+        del account._skip_analytics_backfill
 
     # A fix for a broken subscription is worthless if nothing re-runs it; this
     # is the only thing that does so unattended. Bounded inside

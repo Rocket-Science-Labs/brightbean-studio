@@ -14,6 +14,7 @@ from providers.youtube import (
     _MAX_DEEP_COMMENT_PAGES,
     ANALYTICS_BASE,
     API_BASE,
+    UPLOAD_BASE,
     YouTubeProvider,
 )
 
@@ -87,13 +88,17 @@ class TestGetPostAnalytics:
         assert set(result.keys()) == {"abc123", "def456"}
         # watch_time and avg_view_pct flow through ``extra`` (the catalog
         # mapper reads them from _GENERIC_POST_EXTRA_KEYS).
-        assert result["abc123"].extra == {"watch_time": 1500.0, "avg_view_pct": 47.5}
+        assert result["abc123"].extra == {
+            "watch_time": 1500.0,
+            "avg_view_pct": 47.5,
+            "reported_metrics": {"shares": 12},
+        }
         # shares lives on the PostMetrics dataclass field — that's where
         # ``_post_metrics_to_dict`` looks for it.
         assert result["abc123"].shares == 12
         # Real zero is preserved on extras, not dropped — same semantics
         # as the closure in get_account_metrics.
-        assert result["def456"].extra == {"watch_time": 0.0, "avg_view_pct": 0.0}
+        assert result["def456"].extra == {"watch_time": 0.0, "avg_view_pct": 0.0, "reported_metrics": {"shares": 0}}
         assert result["def456"].shares == 0
 
     @patch.object(YouTubeProvider, "_request")
@@ -283,6 +288,47 @@ class TestErrorClassification:
         exc = YouTubeProvider()._error_for_response(self._error(403, self._QUOTA_BODY, url=f"{ANALYTICS_BASE}/reports"))
 
         assert exc.quota_scope == "analytics"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # The resumable-session POST that publish_post opens with.
+            f"{UPLOAD_BASE}/videos?uploadType=resumable&part=snippet,status",
+            # The PUT to the session's Location, which keeps the path.
+            f"{UPLOAD_BASE}/videos?uploadType=resumable&part=snippet,status&upload_id=xa298sd_f",
+        ],
+    )
+    def test_videos_insert_quota_uses_its_own_upload_scope(self, url):
+        """``videos.insert`` has had a bucket of its own since June 2026.
+
+        The body is the same ``quotaExceeded`` / ``youtube.quota`` the regular
+        pool sends, so only the request can say which ran dry. Filed under
+        "data", 100 uploads would block the inbox, analytics and health checks
+        for the rest of the day with 10,000 units still unspent.
+        """
+        now = datetime(2026, 9, 17, 18, 0, tzinfo=UTC)
+
+        exc = YouTubeProvider()._error_for_response(self._error(403, self._QUOTA_BODY, url=url), now=now)
+
+        assert isinstance(exc, QuotaExceededError)
+        assert exc.quota_scope == "upload"
+        # The buckets roll over together at Pacific midnight.
+        assert exc.resets_at == next_google_quota_reset(now)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # ``videos.list`` — the same resource name, not the upload host.
+            f"{API_BASE}/videos?part=statistics&id=a,b",
+            # On the upload host, but charged 50 units to the regular pool.
+            f"{UPLOAD_BASE}/thumbnails/set?videoId=abc&uploadType=media",
+            f"{API_BASE}/commentThreads?part=snippet",
+        ],
+    )
+    def test_everything_else_stays_on_the_regular_data_pool(self, url):
+        exc = YouTubeProvider()._error_for_response(self._error(403, self._QUOTA_BODY, url=url))
+
+        assert exc.quota_scope == "data"
 
     def test_rate_limit_exceeded_gets_a_short_cooldown_not_a_day(self):
         """A per-second throttle must not cost the rest of the day's syncing."""
@@ -617,6 +663,20 @@ class TestGetMessages:
         assert YouTubeProvider().get_messages("tok") == []
         assert mock_request.call_count == 1
 
+    @patch.object(YouTubeProvider, "_request")
+    def test_a_stored_channel_id_skips_the_lookup(self, mock_request):
+        """Half of every routine poll's cost was this lookup of a value that never changes."""
+        mock_request.side_effect = [_make_response(_page([_thread("a", self.NOW)]))]
+        provider = YouTubeProvider()
+
+        messages = provider.get_messages("tok", since=self.NOW - timedelta(minutes=30), channel_id="UC_stored")
+
+        assert [m.platform_message_id for m in messages] == ["a"]
+        assert mock_request.call_count == 1
+        assert mock_request.call_args.args[1].endswith("/commentThreads")
+        assert mock_request.call_args.kwargs["params"]["allThreadsRelatedToChannelId"] == "UC_stored"
+        assert provider.last_call_quota_units == 1
+
 
 class TestDeepSweepBounds:
     """``deep=True`` raises the ceiling; it must not remove it.
@@ -677,6 +737,70 @@ class TestDeepSweepBounds:
         assert mock_request.call_args_list[2].kwargs["params"]["parentId"] == "old"
         assert mock_request.call_args_list[3].kwargs["params"]["pageToken"] == "reply-page-2"
         assert provider.last_call_quota_units == 4
+
+    def _partly_embedded_thread(self) -> dict:
+        thread = _thread("old", self.NOW - timedelta(days=40), replies=[("embedded", self.NOW - timedelta(days=1))])
+        thread["snippet"]["totalReplyCount"] = 3
+        return thread
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_deep_sweep_skips_replies_the_inbox_already_holds(self, mock_request):
+        fully_embedded = _thread("whole", self.NOW - timedelta(days=30), replies=[("r", self.NOW - timedelta(days=2))])
+        fully_embedded["snippet"]["totalReplyCount"] = 1
+        mock_request.side_effect = [_make_response(_page([self._partly_embedded_thread(), fully_embedded]))]
+        asked: list[list[str]] = []
+
+        def stored(ids):
+            asked.append(ids)
+            return {"old": 3}
+
+        provider = YouTubeProvider()
+        batch = provider.get_messages(
+            "tok",
+            since=self.NOW - timedelta(days=7),
+            deep=True,
+            channel_id="UC_test",
+            stored_reply_counts=stored,
+        )
+
+        # Only the thread page: no ``comments.list`` walk. Embedded replies are still read.
+        assert mock_request.call_count == 1
+        assert [msg.platform_message_id for msg in batch] == ["embedded", "r"]
+        assert provider.last_call_quota_units == 1
+        # Asked once per page, and only about the partly embedded thread.
+        assert asked == [["old"]]
+
+    @pytest.mark.parametrize("stored_count", [2, 4], ids=["count-grew", "deleted-upstream"])
+    @patch.object(YouTubeProvider, "_request")
+    def test_deep_sweep_fetches_replies_unless_the_count_matches_exactly(self, mock_request, stored_count):
+        """A stored count above the total means deletions upstream, which can hide a new reply."""
+        mock_request.side_effect = [
+            _make_response(_page([self._partly_embedded_thread()])),
+            _make_response({"items": []}),
+        ]
+
+        YouTubeProvider().get_messages(
+            "tok",
+            since=self.NOW - timedelta(days=7),
+            deep=True,
+            channel_id="UC_test",
+            stored_reply_counts=lambda ids: {"old": stored_count},
+        )
+
+        assert mock_request.call_count == 2
+        assert mock_request.call_args_list[1].kwargs["params"]["parentId"] == "old"
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_routine_poll_never_asks_for_stored_counts(self, mock_request):
+        mock_request.side_effect = [_make_response(_page([self._partly_embedded_thread()]))]
+        stored = MagicMock(return_value={})
+
+        YouTubeProvider().get_messages(
+            "tok", since=self.NOW - timedelta(minutes=30), channel_id="UC_test", stored_reply_counts=stored
+        )
+
+        stored.assert_not_called()
+        assert mock_request.call_count == 1
 
 
 class TestQuotaUnitAccounting:

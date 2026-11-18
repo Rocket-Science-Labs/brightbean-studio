@@ -11,7 +11,13 @@ from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
 from .meta_insights import fetch_insights_safe, parse_insights_response
-from .meta_messaging import build_send_payload, resolve_recipient_id
+from .meta_messaging import (
+    build_send_payload,
+    dm_extra,
+    merge_page_message_subscription,
+    require_message_id,
+    resolve_recipient_id,
+)
 from .meta_oauth import facebook_login_params
 from .types import (
     AccountMetrics,
@@ -301,6 +307,7 @@ class FacebookProvider(SocialProvider):
             raise PublishError(
                 "page_id is required in content.extra for Facebook publishing",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         if content.post_type == PostType.IMAGE and content.media_urls:
@@ -360,11 +367,13 @@ class FacebookProvider(SocialProvider):
             raise PublishError(
                 f"Facebook multi-photo posts support at most {FACEBOOK_MAX_ATTACHED_MEDIA} photos (got {len(urls)})",
                 platform=self.platform_name,
+                retryable=False,
             )
         if any(content.is_video(index) for index in range(len(urls))):
             raise PublishError(
                 "Facebook multi-photo posts support images only; post videos separately",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         photo_ids: list[str] = []
@@ -473,6 +482,7 @@ class FacebookProvider(SocialProvider):
             raise PublishError(
                 "Facebook Reels require exactly one hosted video",
                 platform=self.platform_name,
+                retryable=False,
             )
         # Fails open on an unknown duration, like TikTok's max-duration check.
         # MediaAsset.duration comes from a best-effort background ffprobe that
@@ -485,6 +495,7 @@ class FacebookProvider(SocialProvider):
             raise PublishError(
                 "Facebook Reels must be between 3 and 90 seconds",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         start_data = self._request(
@@ -854,7 +865,7 @@ class FacebookProvider(SocialProvider):
                 messages.extend(fetch(access_token, since))
             except Exception as exc:
                 failures.append(exc)
-                logger.warning("Facebook %s poll failed: %s", label, exc)
+                logger.warning("Facebook %s poll failed: error_type=%s", label, type(exc).__name__)
 
         # Nothing came back at all: surface the first error so the sync engine
         # logs a real cause instead of silently recording an empty poll.
@@ -883,7 +894,7 @@ class FacebookProvider(SocialProvider):
                 "GET",
                 f"{BASE_URL}/{convo_id}/messages",
                 access_token=access_token,
-                params={"fields": "id,message,from,created_time"},
+                params={"fields": "id,message,from,created_time,attachments"},
             )
             for msg in msg_resp.json().get("data", []):
                 sender = msg.get("from", {})
@@ -902,7 +913,7 @@ class FacebookProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the PSID the Send API needs to reply.
-                        extra={"conversation_id": convo_id, "sender_id": sender_id},
+                        extra=dm_extra(msg, sender_id=sender_id, conversation_id=convo_id),
                     )
                 )
         return messages
@@ -1084,7 +1095,7 @@ class FacebookProvider(SocialProvider):
             json=payload,
         )
         data = resp.json()
-        return ReplyResult(platform_message_id=data.get("message_id", ""), extra=data)
+        return ReplyResult(platform_message_id=require_message_id(data, platform=self.platform_name), extra=data)
 
     def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
         """Reply to a comment or mention by commenting on it.
@@ -1114,6 +1125,15 @@ class FacebookProvider(SocialProvider):
 
     def subscribe_webhooks(self, access_token: str, account_id: str) -> bool:
         """Subscribe this app to the Page's feed, mention and message webhooks."""
+        if self.credentials.get("client_id"):
+            return merge_page_message_subscription(
+                self._request,
+                base_url=BASE_URL,
+                page_id=account_id,
+                access_token=access_token,
+                app_id=self.credentials["client_id"],
+                required_fields=FACEBOOK_WEBHOOK_FIELDS,
+            )
         resp = self._request(
             "POST",
             f"{BASE_URL}/{account_id}/subscribed_apps",

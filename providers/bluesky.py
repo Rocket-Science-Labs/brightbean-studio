@@ -221,6 +221,7 @@ class BlueskyProvider(SocialProvider):
             raise PublishError(
                 f"Post text exceeds {self.max_caption_length} graphemes (got {grapheme_count})",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         # Get session DID

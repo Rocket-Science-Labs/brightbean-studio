@@ -115,6 +115,21 @@ def sidebar_context(request):
     if org_membership and org_membership.org_role in ("owner", "admin"):
         can_create_workspace = True
 
+    # Trustpilot review ask: only for users with at least one connected channel,
+    # in any of their workspaces, so pages without a workspace (settings,
+    # members) don't make it flicker in and out. Closing it lasts until the
+    # next login.
+    show_review_banner = False
+    dismissed_at = request.user.review_banner_dismissed_at
+    last_login = request.user.last_login
+    if dismissed_at is None or (last_login is not None and last_login > dismissed_at):
+        show_review_banner = bool(sidebar_channels) or (
+            SocialAccount.objects.filter(
+                workspace_id__in=[ws.id for ws in sidebar_workspaces],
+                connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+            ).exists()
+        )
+
     return {
         "sidebar_workspaces": sidebar_workspaces,
         "can_create_workspace": can_create_workspace,
@@ -126,7 +141,17 @@ def sidebar_context(request):
         "sidebar_idea_columns": sidebar_idea_columns,
         "sidebar_idea_tags": sidebar_idea_tags,
         "analytics_enabled_platforms": analytics_enabled_platforms,
+        # The analytics views require view_analytics; hide the link from a role
+        # (built-in contributor, or a custom role) that would only get a 403.
+        "sidebar_can_view_analytics": _can_view_analytics(request),
+        "show_review_banner": show_review_banner,
     }
+
+
+def _can_view_analytics(request):
+    from apps.members.decorators import membership_permissions
+
+    return bool(membership_permissions(request).get("view_analytics", False))
 
 
 # Display order for the sidebar's connect shortcuts, most-asked-for first.

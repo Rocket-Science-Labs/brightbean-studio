@@ -9,6 +9,8 @@ from apps.common.managers import WorkspaceScopedManager
 
 
 class InboxMessage(models.Model):
+    api_refreshed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
     class MessageType(models.TextChoices):
         COMMENT = "comment", "Comment"
         MENTION = "mention", "Mention"
@@ -121,6 +123,13 @@ class InboxMessage(models.Model):
     @property
     def platform(self):
         return self.social_account.platform
+
+    @property
+    def attachments(self):
+        from providers.meta_messaging import normalize_attachments
+
+        extra = self.extra or {}
+        return normalize_attachments(extra.get("attachments", (extra.get("message") or {}).get("attachments", [])))
 
 
 class InboxReply(models.Model):

@@ -78,11 +78,6 @@ UNSUPPORTED_MIME_MESSAGES = {
     "image/avif": "AVIF images aren't supported. Export the image as JPG or PNG and upload it again.",
 }
 
-# ISO Base Media (ftyp) major brands that are still images, not video.
-# iPhones save photos as HEIC, which shares MP4's container.
-_HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}
-_AVIF_BRANDS = {b"avif", b"avis"}
-
 
 def determine_file_type(mime_type):
     """Map a MIME type to our FileType enum value."""
@@ -114,6 +109,43 @@ def storage_filename(original_name, sniffed_mime):
         stem = ""
 
     return f"{stem or 'upload'}.{extension}"
+
+
+_STILL_IMAGE_FTYP_BRANDS = frozenset(
+    {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"avif", b"avis"}
+)
+_LEGACY_QUICKTIME_ATOMS = frozenset({b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot"})
+# The AVIF subset of the still-image brands above; the rest are HEIC/HEIF.
+_AVIF_FTYP_BRANDS = frozenset({b"avif", b"avis"})
+
+
+def _unsupported_image_mime(file_obj):
+    """``image/heic`` or ``image/avif`` for an ISO-BMFF still image, else None.
+
+    ``sniff_mime`` returns None for these (a hard reject, like any unknown
+    file); this only lets ``validate_file`` say *why*, with advice the user can
+    act on, instead of the generic "unrecognised file type".
+    """
+    if not hasattr(file_obj, "read") or not hasattr(file_obj, "seek"):
+        return None
+    import contextlib
+
+    try:
+        file_obj.seek(0)
+        head = file_obj.read(12)
+    except (OSError, ValueError):
+        return None
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            file_obj.seek(0)
+    if not isinstance(head, (bytes, bytearray)) or head[4:8] != b"ftyp":
+        return None
+    brand = bytes(head[8:12])
+    if brand in _AVIF_FTYP_BRANDS:
+        return "image/avif"
+    if brand in _STILL_IMAGE_FTYP_BRANDS:
+        return "image/heic"
+    return None
 
 
 # Magic-byte signatures for sniffing the *real* MIME of an uploaded file.
@@ -155,15 +187,19 @@ def sniff_mime(file_obj):
     if head[4:8] == b"ftyp":
         # ISO Base Media: covers MP4, MOV/QuickTime, M4V, and also HEIC/HEIF
         # and AVIF still images. The major brand tells them apart; any brand
-        # not listed as an image stays video, as before.
+        # not listed as a still image stays video.
         brand = head[8:12]
-        if brand in _HEIF_BRANDS:
-            return "image/heic"
-        if brand in _AVIF_BRANDS:
-            return "image/avif"
+        if brand in _STILL_IMAGE_FTYP_BRANDS:
+            # HEIC/AVIF photos share the container. Calling them video/mp4
+            # stored an iPhone photo as a broken .mp4 that failed processing
+            # and publishing; refusing says plainly that the format is unsupported.
+            return None
         if brand in (b"qt  ",):
             return "video/quicktime"
         return "video/mp4"
+    if head[4:8] in _LEGACY_QUICKTIME_ATOMS:
+        # Older QuickTime files open with a moov/mdat/wide/free atom and no ftyp.
+        return "video/quicktime"
     if head.startswith(b"\x1aE\xdf\xa3"):
         return "video/webm"
     if head.startswith(b"RIFF") and head[8:12] == b"AVI ":
@@ -171,6 +207,20 @@ def sniff_mime(file_obj):
     if head.startswith(b"%PDF-"):
         return "application/pdf"
     return None
+
+
+def image_upload_name(uploaded_file):
+    """The name to store a small image upload under, or None if it isn't one.
+
+    For the uploads that skip ``create_asset`` (avatars, workspace logos):
+    decide by the sniffed bytes rather than the client's Content-Type, and
+    rename to the extension those bytes justify, so a logo can't be stored as
+    "probe.html" and served back as a page on the app's origin.
+    """
+    sniffed = sniff_mime(uploaded_file)
+    if sniffed not in ALLOWED_MIME_TYPES["image"]:
+        return None
+    return storage_filename(uploaded_file.name, sniffed)
 
 
 def validate_file(uploaded_file):
@@ -183,9 +233,11 @@ def validate_file(uploaded_file):
     errors = []
 
     sniffed = sniff_mime(uploaded_file)
-    if sniffed in UNSUPPORTED_MIME_MESSAGES:
-        errors.append(UNSUPPORTED_MIME_MESSAGES[sniffed])
-        return None, errors
+    if sniffed is None:
+        unsupported = _unsupported_image_mime(uploaded_file)
+        if unsupported in UNSUPPORTED_MIME_MESSAGES:
+            errors.append(UNSUPPORTED_MIME_MESSAGES[unsupported])
+            return None, errors
     if not sniffed or sniffed not in ALL_ALLOWED_MIMES:
         # Reject. We do not echo back the client-supplied content_type because
         # that's misleading when the magic doesn't match.
@@ -250,6 +302,12 @@ def _image_pixel_errors(uploaded_file) -> list[str]:
             uploaded_file.seek(0)
 
 
-def get_accepted_file_types():
-    """Return a comma-separated string of accepted MIME types for HTML file input."""
-    return ",".join(sorted(ALL_ALLOWED_MIMES))
+def get_accepted_file_types(*kinds):
+    """Return a comma-separated string of accepted MIME types for HTML file input.
+
+    With ``kinds`` (e.g. ``"image", "video"``), only those groups of
+    ``ALLOWED_MIME_TYPES``; otherwise everything the library accepts.
+    """
+    if not kinds:
+        return ",".join(sorted(ALL_ALLOWED_MIMES))
+    return ",".join(sorted(mime for kind in kinds for mime in ALLOWED_MIME_TYPES[kind]))

@@ -66,7 +66,10 @@ class PinterestProvider(SocialProvider):
 
     @property
     def required_scopes(self) -> list[str]:
-        return ["user_accounts:read", "boards:read", "pins:read", "pins:write"]
+        # ``POST /pins`` needs boards:write as well as pins:write — it writes
+        # to the board. Without it every pin failed with a 401 ("Missing:
+        # ['boards:write']") on an account that otherwise looked healthy.
+        return ["user_accounts:read", "boards:read", "boards:write", "pins:read", "pins:write"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -182,6 +185,7 @@ class PinterestProvider(SocialProvider):
             raise PublishError(
                 "board_id is required in content.extra for Pinterest pins",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         payload: dict = {
@@ -216,11 +220,13 @@ class PinterestProvider(SocialProvider):
                 "Pinterest image file upload not supported via this provider; "
                 "use media_urls with a hosted image URL instead",
                 platform=self.platform_name,
+                retryable=False,
             )
         else:
             raise PublishError(
                 "No media provided for Pinterest pin",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         resp = self._request(

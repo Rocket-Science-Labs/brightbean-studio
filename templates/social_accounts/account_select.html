@@ -4,11 +4,15 @@
 <div class="max-w-2xl">
     <!-- Header -->
     <div class="mb-8">
+        {% if platform == "youtube" %}
+        <div class="w-12 h-12 flex items-center justify-center mb-4">{% include "partials/_youtube_icon.html" with size="24" %}</div>
+        {% else %}
         <div class="w-12 h-12 rounded-xl bg-blue-50 flex items-center justify-center mb-4">
             {% include "social_accounts/partials/_platform_icon.html" with platform=platform size="6" %}
         </div>
+        {% endif %}
         <h2 class="text-xl font-semibold text-stone-900">Select Account{{ pages|length|pluralize }}</h2>
-        <p class="text-sm text-stone-500 mt-1">Your {{ platform|title }} login has access to multiple accounts. Select which one{{ pages|length|pluralize }} to connect.</p>
+        <p class="text-sm text-stone-500 mt-1">Your {% if platform == "youtube" %}YouTube{% else %}{{ platform|title }}{% endif %} login has access to multiple accounts. Select which one{{ pages|length|pluralize }} to connect.</p>
     </div>
 
     <form method="post" action="{% url 'social_accounts:select_account' %}">
@@ -42,7 +46,7 @@
                 <img src="{{ page.picture }}" alt="{{ page.name }}" class="w-10 h-10 rounded-full object-cover ring-2 ring-stone-100">
                 {% else %}
                 <div class="w-10 h-10 rounded-full bg-stone-100 flex items-center justify-center text-stone-400">
-                    {% include "social_accounts/partials/_platform_icon.html" with platform=platform size="5" %}
+                    {% if platform == "youtube" %}<span class="text-xs font-semibold">{{ page.name|make_list|first|upper }}</span>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=platform size="5" %}{% endif %}
                 </div>
                 {% endif %}
 
@@ -56,10 +60,13 @@
                     {% elif page.already_connected %}
                     <p class="text-xs text-emerald-600 mt-0.5">Already connected &middot; select to refresh</p>
                     {% endif %}
+                    {% if page.can_message is False %}
+                    <p class="text-xs text-amber-600 mt-0.5">DMs unavailable: grant messaging access on the linked Facebook Page, then reconnect.</p>
+                    {% endif %}
                 </div>
 
                 {% if page.followers_count %}
-                <span class="text-xs text-stone-400">{{ page.followers_count }} followers</span>
+                <span class="text-xs text-stone-400">{{ page.followers_count }} {% if platform == "youtube" %}subscribers{% else %}followers{% endif %}</span>
                 {% endif %}
             </label>
             {% endfor %}

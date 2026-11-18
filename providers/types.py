@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Protocol
 from urllib.parse import urlparse
 
 # Extension heuristic for spotting video URLs.
@@ -176,6 +178,18 @@ class RateLimitConfig:
     extra: dict = field(default_factory=dict)
 
 
+class UploadCache(Protocol):
+    """Somewhere a provider can remember an upload between publish attempts.
+
+    Best-effort: ``get`` may return None for anything, and providers must check
+    a remembered upload is still usable before relying on it.
+    """
+
+    def get(self, key: str) -> str | None: ...
+
+    def set(self, key: str, value: str, timeout: int) -> None: ...
+
+
 @dataclass
 class PublishContent:
     """Content payload passed to publish_post()."""
@@ -195,6 +209,17 @@ class PublishContent:
     # Per-item media type ("image" / "video" / "gif" / ...), parallel to
     # ``media_urls``. Filled by the engine from MediaAsset.media_type.
     media_types: list[str] = field(default_factory=list)
+    # The same for every attempt at one PlatformPost. A provider whose platform
+    # honours request idempotency sends it, so a retry after a lost response
+    # cannot publish twice.
+    idempotency_key: str | None = None
+    # Lets a provider reuse an upload the platform already accepted on an
+    # earlier attempt instead of sending (and re-processing) the file again.
+    upload_cache: UploadCache | None = None
+    # True once the worker has been told to stop. Long waits should give up so
+    # the attempt is rescheduled inside the shutdown grace period instead of
+    # being killed mid-publish.
+    should_stop: Callable[[], bool] | None = None
 
     def is_video(self, index: int = 0) -> bool:
         """Whether media item ``index`` is a video.

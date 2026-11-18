@@ -301,6 +301,7 @@ class TikTokProvider(SocialProvider):
             raise PublishError(
                 "TikTok only supports VIDEO posts",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         privacy_level_is_explicit = "privacy_level" in content.extra

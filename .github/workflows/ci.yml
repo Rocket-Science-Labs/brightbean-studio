@@ -69,25 +69,10 @@ jobs:
 
   test:
     name: Test (pytest)
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: the Postgres below is the one this
+    # runner image ships, so an image bump must not silently change its version.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    services:
-      postgres:
-        # Pulled via AWS's public mirror of Docker Hub official images —
-        # avoids anonymous Docker Hub pulls, whose timeouts/rate limits
-        # broke main CI on 2026-06-10 (run 27262568530).
-        image: public.ecr.aws/docker/library/postgres:16-alpine
-        env:
-          POSTGRES_DB: brightbean_test
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       DJANGO_SETTINGS_MODULE: config.settings.test
       SECRET_KEY: test-secret-key-not-for-production
@@ -109,6 +94,24 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Uses the PostgreSQL preinstalled on the runner instead of a service
+      # container. Anonymous image pulls kept failing before any test ran:
+      # Docker Hub's rate limits broke main CI on 2026-06-10 (run 27262568530),
+      # and the AWS ECR Public mirror that replaced it caps anonymous pulls per
+      # source IP, which GitHub-hosted runners share ("toomanyrequests: Data
+      # limit exceeded", run 40125394980).
+      - name: Start PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          pg_isready --timeout=30
+          version=$(sudo -u postgres psql -tAc "SHOW server_version_num")
+          if [ "${version:0:2}" != "16" ]; then
+            echo "::error::Expected PostgreSQL 16 on the runner, got server_version_num $version"
+            exit 1
+          fi
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb brightbean_test
 
       # Catches a model change whose migration was never generated. The
       # companion hazard — a migration that is fine against an empty table but

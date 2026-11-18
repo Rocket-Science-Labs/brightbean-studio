@@ -249,6 +249,7 @@ class GoogleBusinessProvider(SocialProvider):
             raise PublishError(
                 f"Post text exceeds {self.max_caption_length} characters (got {len(content.text)})",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         account_id = self._get_account_id(access_token)

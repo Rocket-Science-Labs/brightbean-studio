@@ -10,15 +10,21 @@ from apps.social_accounts.error_messages import (
     FIRST_COMMENT_TEMPORARY_MESSAGE,
     GENERIC_MESSAGE,
     PLATFORM_UNAVAILABLE_MESSAGE,
+    PUBLISH_EXHAUSTED_MESSAGE,
     PUBLISH_GENERIC_MESSAGE,
+    PUBLISH_QUOTA_EXHAUSTED_MESSAGE,
+    PUBLISH_RATE_LIMIT_MESSAGE,
     PUBLISH_RECONNECT_MESSAGE,
     PUBLISH_REJECTED_MESSAGE,
+    PUBLISH_TEMPORARY_MESSAGE,
     QUOTA_EXHAUSTED_MESSAGE,
     RATE_LIMIT_MESSAGE,
     RECONNECT_MESSAGE,
+    exhausted_publish_message,
     friendly_first_comment_error,
     friendly_health_check_error,
     friendly_publish_error,
+    is_credential_rejection,
     quota_blocked_message,
     quota_connect_error,
 )
@@ -351,3 +357,69 @@ class TestQuotaBlockedMessage:
 
         assert "temporarily rate-limited" in message
         assert "daily API limit" not in message
+
+
+class TestIsCredentialRejection:
+    """What the publish engine stops retrying on. Narrower than "reconnect"
+    advice: a bare 403 can be a throttle, and a throttle must keep retrying."""
+
+    def test_a_401_is_a_rejection(self):
+        assert is_credential_rejection(APIError("missing scope", status_code=401))
+
+    def test_a_403_is_not(self):
+        assert not is_credential_rejection(APIError("forbidden", status_code=403))
+
+    def test_auth_exception_types_are_rejections(self):
+        assert is_credential_rejection(TokenExpiredError("expired"))
+        assert is_credential_rejection(OAuthError("refused"))
+
+    def test_an_expired_token_error_code_is_a_rejection(self):
+        exc = APIError("bad", status_code=400, raw_response={"error": "invalid_grant"})
+        assert is_credential_rejection(exc)
+
+    def test_a_graph_error_dict_is_not_mistaken_for_a_code(self):
+        exc = APIError("bad", status_code=400, raw_response={"error": {"code": 100}})
+        assert not is_credential_rejection(exc)
+
+    def test_a_body_that_is_not_a_json_object_is_not_a_crash(self):
+        """``_safe_json`` returns whatever the body parsed to. A list or bare
+        string raising here would escape the publish engine's except block
+        and strand the post in ``publishing``."""
+        for body in (["forbidden"], "Forbidden", 42):
+            exc = APIError("nope", status_code=403, raw_response=body)
+            assert not is_credential_rejection(exc)
+            assert friendly_publish_error(APIError("down", status_code=502, raw_response=body)) == (
+                PUBLISH_TEMPORARY_MESSAGE
+            )
+
+    def test_throttles_and_content_errors_are_not_rejections(self):
+        assert not is_credential_rejection(RateLimitError("slow down"))
+        assert not is_credential_rejection(QuotaExceededError("spent", status_code=403))
+        assert not is_credential_rejection(PublishError("TikTok only supports VIDEO posts"))
+
+
+class TestExhaustedPublishMessage:
+    """What a post says once it has run out of retries."""
+
+    def test_retry_promises_give_way(self):
+        assert exhausted_publish_message(PUBLISH_TEMPORARY_MESSAGE) == PUBLISH_EXHAUSTED_MESSAGE
+        assert exhausted_publish_message(PUBLISH_RATE_LIMIT_MESSAGE) == PUBLISH_EXHAUSTED_MESSAGE
+
+    def test_the_generic_message_gives_way(self):
+        assert exhausted_publish_message(PUBLISH_GENERIC_MESSAGE) == PUBLISH_EXHAUSTED_MESSAGE
+        assert exhausted_publish_message("") == PUBLISH_EXHAUSTED_MESSAGE
+
+    def test_a_specific_message_is_kept(self):
+        """Replacing these is how Carlos's post ended as "kept failing"."""
+        assert exhausted_publish_message("TikTok only supports VIDEO posts") == "TikTok only supports VIDEO posts"
+        assert exhausted_publish_message(PUBLISH_REJECTED_MESSAGE) == PUBLISH_REJECTED_MESSAGE
+
+    def test_reconnect_advice_gives_way(self):
+        """A sure refusal fails at once; what exhausts is a bare 403, which can
+        be a throttle, so "reconnect" could send a healthy account to reconnect."""
+        assert exhausted_publish_message(PUBLISH_RECONNECT_MESSAGE) == PUBLISH_EXHAUSTED_MESSAGE
+
+    def test_the_quota_message_drops_its_resume_promise(self):
+        with_promise = f"{PUBLISH_QUOTA_EXHAUSTED_MESSAGE} We'll resume after 07:00 UTC."
+
+        assert exhausted_publish_message(with_promise) == PUBLISH_QUOTA_EXHAUSTED_MESSAGE

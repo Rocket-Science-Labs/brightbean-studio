@@ -63,6 +63,7 @@ def test_get_user_pages_returns_linked_instagram_business_accounts():
             "page_name": "Facebook Page",
             "tasks": ["CREATE_CONTENT"],
             "can_publish": True,
+            "can_message": False,
         }
     ]
     provider._request.assert_called_once()
@@ -926,9 +927,8 @@ def test_subscribing_targets_the_instagram_user_with_instagram_fields():
     assert not sent & PAGE_ONLY_WEBHOOK_FIELDS
 
 
-def test_instagram_never_subscribes_to_messages():
-    """This OAuth flow never requests instagram_manage_messages, so Meta would
-    reject the subscription outright."""
+def test_instagram_keeps_message_fields_off_the_comment_subscription():
+    """Messages are subscribed separately on the linked Page."""
     from providers.instagram import INSTAGRAM_WEBHOOK_FIELDS
 
     assert "messages" not in INSTAGRAM_WEBHOOK_FIELDS

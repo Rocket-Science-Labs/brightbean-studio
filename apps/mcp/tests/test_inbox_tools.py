@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.test import Client
@@ -153,6 +153,26 @@ def draft_only_client(db, user, memberships, workspace, account):
 
 
 @pytest.mark.django_db
+def test_mcp_late_dm_retains_draft_even_when_app_and_actor_are_authorized(full_client, message):
+    stamp = timezone.now() - timedelta(hours=30)
+    message.message_type = "dm"
+    message.sender_handle = "customer"
+    message.received_at = stamp
+    message.extra = {"sender_id": "customer", "platform_timestamp": stamp.isoformat()}
+    message.save()
+    provider = MagicMock()
+    with (
+        patch("apps.inbox.services.get_provider", return_value=provider),
+        patch("apps.publisher.engine._resolve_publish_credentials", return_value={"human_agent_enabled": True}),
+    ):
+        status, body = _call(full_client, "send_reply", {"message_id": str(message.id), "body": "Answer"})
+    assert status == 200
+    assert "web inbox" in body["error"]["message"]
+    provider.reply_to_message.assert_not_called()
+    assert InboxReply.objects.get(inbox_message=message).status == "failed"
+
+
+@pytest.mark.django_db
 class TestInboxReadTools:
     def test_list_inbox_messages(self, full_client, message):
         InboxReply.objects.create(inbox_message=message, body="a draft")
@@ -224,7 +244,9 @@ class TestInboxReplyTools:
         with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-1") as dispatch:
             _s, body = _call(full_client, "send_reply", {"reply_id": str(reply.id)})
         assert _result_json(body)["status"] == "sent"
-        dispatch.assert_called_once_with(message, "ready")
+        dispatch.assert_called_once()
+        assert dispatch.call_args.args == (message, "ready")
+        assert dispatch.call_args.kwargs["origin"] == "programmatic"
         assert message.replies.count() == 1
 
     def test_send_reply_create_and_send(self, full_client, message):
@@ -233,7 +255,9 @@ class TestInboxReplyTools:
         data = _result_json(body)
         assert data["status"] == "sent"
         assert data["platform_reply_id"] == "plat-2"
-        dispatch.assert_called_once_with(message, "yo")
+        dispatch.assert_called_once()
+        assert dispatch.call_args.args == (message, "yo")
+        assert dispatch.call_args.kwargs["origin"] == "programmatic"
         assert message.replies.count() == 1
 
     @pytest.mark.parametrize("extra_fields", [("message_id",), ("body",), ("message_id", "body")])

@@ -67,10 +67,14 @@ class UploadMediaValidationTests(TestCase):
         self.assertEqual(asset.media_type, MediaAsset.MediaType.IMAGE)
         self.assertEqual(asset.mime_type, "image/png")
 
-    def test_gif_stays_an_image_for_the_publisher(self):
+    def test_gif_is_stored_as_gif_with_sniffed_mime(self):
+        # The composer stores uploads through create_asset, which keeps GIFs as
+        # "gif"; the publisher resolves a lone GIF to an IMAGE post.
         response = self._upload("anim.gif", _gif_bytes(), "image/gif")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(MediaAsset.objects.get().media_type, MediaAsset.MediaType.IMAGE)
+        asset = MediaAsset.objects.get()
+        self.assertEqual(asset.media_type, MediaAsset.MediaType.GIF)
+        self.assertEqual(asset.mime_type, "image/gif")
 
     def test_iphone_heic_photo_is_rejected_not_stored_as_video(self):
         heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 16

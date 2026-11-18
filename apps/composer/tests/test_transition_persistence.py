@@ -119,9 +119,21 @@ class SchedulingPathsPersistTheResetTest(TestCase):
         assert pp.publish_error == ""
 
     def test_rest_and_mcp_scheduling_service(self):
+        from apps.composer.models import PostMedia
         from apps.composer.services import transition_platform_post
+        from apps.media_library.models import MediaAsset
 
         pp = _failed_row(self.workspace, self.account)
+        # The service refuses to schedule a TikTok post with nothing to upload.
+        video = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            file="test/clip.mp4",
+            filename="clip.mp4",
+            media_type=MediaAsset.MediaType.VIDEO,
+            mime_type="video/mp4",
+        )
+        PostMedia.objects.create(post=pp.post, media_asset=video)
 
         transition_platform_post(pp, "scheduled", scheduled_at=timezone.now() + timedelta(hours=1))
 

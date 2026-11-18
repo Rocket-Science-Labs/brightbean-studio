@@ -19,7 +19,7 @@ def run_publish_cycle():
     """Poll for due posts and publish them.
 
     Registered as a recurring task (every 15s) so that
-    ``python manage.py process_tasks`` handles publishing
+    ``python manage.py run_studio_worker`` handles publishing
     without needing a separate ``run_publisher`` process.
     """
     from apps.publisher.engine import PublishEngine

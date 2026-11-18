@@ -22,6 +22,9 @@ from providers.exceptions import (
 )
 
 RECONNECT_MESSAGE = "Account connection expired. Please reconnect."
+CHANNEL_UNAVAILABLE_MESSAGE = (
+    "This YouTube channel is no longer available to the connected Google account. Please reconnect."
+)
 RATE_LIMIT_MESSAGE = "Rate limit reached. We'll retry this check shortly."
 # A spent daily budget is not the rate limit above, and must not borrow its
 # copy: "shortly" can be twenty hours away. YouTube's Data API quota, the one
@@ -40,7 +43,12 @@ FIRST_COMMENT_QUOTA_EXHAUSTED_MESSAGE = "The platform's daily API limit is used 
 FIRST_COMMENT_REJECTED_MESSAGE = "The platform rejected the first comment. Add it manually on the post."
 FIRST_COMMENT_GENERIC_MESSAGE = "The first comment couldn't be added. Add it manually on the post."
 
-PUBLISH_RECONNECT_MESSAGE = "The account connection expired, so the post couldn't be published. Please reconnect it."
+# Not "the connection expired": the same refusal covers a revoked grant and one
+# that never included a scope the post needs (Pinterest's boards:write), and
+# the advice is the same for all three.
+PUBLISH_RECONNECT_MESSAGE = (
+    "The platform refused our access to this account, so the post couldn't be published. Please reconnect it."
+)
 PUBLISH_TEMPORARY_MESSAGE = "The platform was temporarily unavailable. We'll retry shortly."
 PUBLISH_RATE_LIMIT_MESSAGE = "The platform's rate limit was reached. We'll retry shortly."
 PUBLISH_QUOTA_EXHAUSTED_MESSAGE = "The platform's daily API limit is used up, so the post couldn't be published."
@@ -100,6 +108,21 @@ _REJECTED = "rejected"
 _UNKNOWN = "unknown"
 
 
+def _has_expired_token_code(exc: APIError) -> bool:
+    """Whether the response body names an expired or revoked token.
+
+    Guards two shapes, because either one escaping as an exception would break
+    the ``except`` block that called us. The body is whatever the response
+    parsed to (``SocialProvider._safe_json``), so a JSON list or bare string
+    has no ``.get``. And ``raw_response["error"]`` is a bare string on OAuth
+    token endpoints ("invalid_grant") but a *dict* on every Graph API error,
+    which can't be looked up in a set.
+    """
+    raw = exc.raw_response
+    error_code = raw.get("error") if isinstance(raw, dict) else None
+    return isinstance(error_code, str) and error_code in _EXPIRED_TOKEN_ERRORS
+
+
 def _classify(exc: Exception) -> str:
     """Reduce a provider exception to one of the failure shapes above."""
     if isinstance(exc, TokenExpiredError):
@@ -122,12 +145,7 @@ def _classify(exc: Exception) -> str:
     if isinstance(exc, APIError):
         if exc.status_code in (401, 403):
             return _RECONNECT
-        # ``raw_response["error"]`` is a bare string on OAuth token endpoints
-        # ("invalid_grant") but a *dict* on every Graph API error. Hashing a
-        # dict against this set raises TypeError, which would escape whatever
-        # ``except`` block called us — guard the type, don't assume the shape.
-        error_code = (exc.raw_response or {}).get("error")
-        if isinstance(error_code, str) and error_code in _EXPIRED_TOKEN_ERRORS:
+        if _has_expired_token_code(exc):
             return _RECONNECT
         if exc.status_code is not None and exc.status_code >= 500:
             return _UNAVAILABLE
@@ -274,6 +292,35 @@ class WebhookFailure(NamedTuple):
     needs_reconnect: bool
 
 
+def omit_disabled_instagram_dm_failure(failure: WebhookFailure) -> WebhookFailure | None:
+    """Remove known, persisted DM-only failures when messaging consent is omitted.
+
+    Legacy subscription state stores combined channel errors as text. Match
+    only the provider's known DM messages, leaving metadata and unrecognised
+    errors intact. A remaining transient comment failure must offer a retry,
+    even if the removed DM failure originally required reconnecting.
+    """
+    message = failure.message
+    for obsolete in (
+        "DM notifications require messaging permissions and Page messaging access. Reconnect Instagram.",
+        "DM notifications failed. Check messaging permissions and reconnect Instagram.",
+        "DM notifications failed. Try again.",
+        "DM notifications could not be confirmed on the linked Page.",
+        "Comment notifications are connected. Reconnect Instagram to enable DM notifications on its linked Page.",
+    ):
+        message = message.replace(obsolete, "")
+    if message == failure.message:
+        return failure
+    message = message.strip()
+    if not message:
+        return None
+    retryable_comment_failure = message in (
+        "Comment/mention notifications were not enabled.",
+        "Comment/mention notifications failed. Try again.",
+    )
+    return WebhookFailure(message, failure.needs_reconnect and not retryable_comment_failure)
+
+
 def classify_webhook_failure(exc: Exception) -> WebhookFailure:
     """Map a failed webhook subscription to user-facing text and a next step.
 
@@ -321,6 +368,58 @@ def friendly_publish_error(exc: Exception) -> str:
         },
         PUBLISH_GENERIC_MESSAGE,
     )
+
+
+def is_credential_rejection(exc: Exception) -> bool:
+    """Whether the platform refused the credentials themselves.
+
+    Narrower than the reconnect shape the copy above uses. A bare 403 also
+    earns "reconnect" advice, but some platforms answer a throttle with 403,
+    and the publish engine stops retrying on this — so only a 401, an
+    expired-token error code, or an exception that is an auth failure by type
+    counts here.
+    """
+    if isinstance(exc, TokenExpiredError | OAuthError):
+        return True
+    if isinstance(exc, APIError):
+        return exc.status_code == 401 or _has_expired_token_code(exc)
+    return False
+
+
+# What gives way to PUBLISH_EXHAUSTED_MESSAGE when the retry budget runs out:
+# the two sentences that promise another attempt, the generic one, which says
+# less than the exhausted copy does — and the reconnect one. A refusal the
+# engine is sure about (a live token rejected) fails at once and never gets
+# here; what does is a bare 403, which some platforms send for a throttle, or
+# a refusal of an expired token whose refresh kept failing. Telling the first
+# to reconnect a healthy account would be wrong, and the exhausted copy
+# already offers reconnecting for the second.
+_SUPERSEDED_WHEN_EXHAUSTED = frozenset(
+    {
+        PUBLISH_TEMPORARY_MESSAGE,
+        PUBLISH_RATE_LIMIT_MESSAGE,
+        PUBLISH_GENERIC_MESSAGE,
+        PUBLISH_RECONNECT_MESSAGE,
+    }
+)
+
+
+def exhausted_publish_message(last_message: str) -> str:
+    """The message a post keeps once it has run out of retries.
+
+    Anything more specific than a retry promise stays. Replacing every message
+    here is how "TikTok only supports VIDEO posts" and Pinterest's missing-scope
+    401 both ended as "kept failing ... reconnect the account", hiding the one
+    fact the user needed.
+    """
+    if not last_message or last_message in _SUPERSEDED_WHEN_EXHAUSTED:
+        return PUBLISH_EXHAUSTED_MESSAGE
+    # The quota copy carries "We'll resume after 08:00 UTC", which stops being
+    # true once there is no attempt left to resume with. The sentence before it
+    # still is.
+    if last_message.startswith(PUBLISH_QUOTA_EXHAUSTED_MESSAGE):
+        return PUBLISH_QUOTA_EXHAUSTED_MESSAGE
+    return last_message
 
 
 CONNECT_QUOTA_EXHAUSTED_MESSAGE = "{platform}'s daily API limit is used up, so the account couldn't be connected."

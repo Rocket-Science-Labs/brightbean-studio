@@ -57,6 +57,25 @@ def _inviter_workspace_level(inviter, org, workspace_id):
     return WS_ROLE_LEVEL.get(ws_membership.workspace_role, 0)
 
 
+def _ensure_can_accept(email):
+    """Refuse an invite that could never be accepted.
+
+    With SIGNUP_MODE=closed an invitation cannot create an account, so only
+    someone who already has one — under any of their addresses, as allauth
+    logs people in — could ever accept it. ``filter_users_by_email`` matches
+    ``User.email`` exactly, so a mixed-case stored address is checked separately.
+    """
+    if settings.SIGNUP_MODE != "closed":
+        return
+    from allauth.account.utils import filter_users_by_email
+    from django.contrib.auth import get_user_model
+
+    if not filter_users_by_email(email) and not get_user_model().objects.filter(email__iexact=email).exists():
+        raise ValueError(
+            "Sign-up is closed on this installation, so only people who already have an account can be invited."
+        )
+
+
 def create_invitation(org, email, org_role, workspace_assignments, invited_by, *, inviter=None):
     """Create an invitation and send the invite email.
 
@@ -71,13 +90,16 @@ def create_invitation(org, email, org_role, workspace_assignments, invited_by, *
         The created Invitation.
 
     Raises:
-        ValueError: If the email already belongs to a member or has a pending invite.
+        ValueError: If the email already belongs to a member or has a pending invite,
+            or SIGNUP_MODE is closed and the email has no account.
     """
     email = email.strip().lower()
 
     # Check if already a member
     if OrgMembership.objects.filter(organization=org, user__email=email).exists():
         raise ValueError("This person is already a member of your organization.")
+
+    _ensure_can_accept(email)
 
     # Check for pending invite
     pending = Invitation.objects.filter(
@@ -277,11 +299,13 @@ def resend_invitation(invitation):
 
     Raises:
         ValueError: If the invitation is already accepted, is inside its
-            cooldown, has been sent as many times as it is allowed, or the
-            email could not be sent.
+            cooldown, has been sent as many times as it is allowed, could not
+            be accepted because SIGNUP_MODE is closed and the email has no
+            account, or the email could not be sent.
     """
     if invitation.is_accepted:
         raise ValueError("This invitation has already been accepted.")
+    _ensure_can_accept(invitation.email)
 
     max_sends = getattr(settings, "INVITE_MAX_SENDS", 3)
     if invitation.send_count >= max_sends:

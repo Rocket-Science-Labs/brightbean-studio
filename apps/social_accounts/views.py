@@ -14,6 +14,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core import signing
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
@@ -373,6 +374,11 @@ def oauth_callback(request, platform):
                         # path it is the short-lived expiry, which the account
                         # must carry to be seen as expiring at all.
                         "expires_in": None if promoted else tokens.expires_in,
+                        "user_expires_at": (
+                            (timezone.now() + timedelta(seconds=tokens.expires_in)).isoformat()
+                            if tokens.expires_in
+                            else None
+                        ),
                     },
                     "pages": pages,
                 }
@@ -413,6 +419,7 @@ def oauth_callback(request, platform):
             workspace_id=workspace_id,
             platform=platform,
             profile=profile,
+            authorizing_user=request.user,
             access_token=tokens.access_token,
             refresh_token=tokens.refresh_token,
             expires_in=tokens.expires_in,
@@ -520,9 +527,14 @@ def select_account(request):
                 access_token=access_token,
                 refresh_token=user_tokens.get("refresh_token"),
                 expires_in=user_tokens.get("expires_in"),
+                facebook_user_access_token=user_tokens.get("access_token", "") if platform == "instagram" else None,
+                facebook_user_token_expires_at=user_tokens.get("user_expires_at"),
                 # Instagram-via-Facebook receives its webhooks through the
                 # linked Page, so remember which Page to subscribe.
                 webhook_target_id=page.get("page_id", ""),
+                messaging_access=False
+                if platform == "instagram" and not page.get("access_token")
+                else page.get("can_message"),
             )
             connected.append(page["name"])
 
@@ -841,17 +853,31 @@ def _render_account_card(request, account, workspace_id):
 def disconnect(request, workspace_id, account_id):
     """Disconnect a social account."""
     account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
+    if account.platform == "youtube":
+        from .youtube_compliance import purge_connection
+
+        name = account.account_name or account.account_handle
+        purge_connection(account)
+        messages.success(request, f"Disconnected {name}. YouTube data was deleted immediately.")
+        if request.headers.get("HX-Request"):
+            return render(request, "social_accounts/partials/_empty.html")
+        return redirect("social_accounts:list", workspace_id=workspace_id)
 
     # Stop the platform pushing us this account's activity before we drop the
     # token that would let us unsubscribe.
     if account.oauth_access_token:
         unsubscribe_account_webhooks(account)
 
-    # Try to revoke token
+    # Try to revoke token. The account's own credentials, not just the org's:
+    # a Mastodon grant lives on the account's instance, under that instance's
+    # app registration, and revoking without them calls an empty base URL.
     try:
-        provider = _get_provider_for_platform(account.platform, request.org.id)
-        if account.oauth_access_token:
-            provider.revoke_token(account.oauth_access_token)
+        from apps.publisher.engine import _resolve_publish_credentials
+        from providers import get_provider
+
+        provider = get_provider(account.platform, _resolve_publish_credentials(account))
+        if account.revocation_token:
+            provider.revoke_token(account.revocation_token)
     except Exception:
         logger.warning(
             "Failed to revoke token for %s, proceeding with disconnect",
@@ -957,8 +983,8 @@ def resolve_page_account_token(page: dict, platform: str, user_access_token: str
     revokes the app for the whole person — makes a per-account disconnect able
     to sever every other connection they have.
 
-    Instagram-via-Facebook is the one exception: its calls address the IG user,
-    so the user token is the correct credential when the Page dict carries none.
+    Legacy Instagram publishing/comments can fall back to the user token when
+    Meta omits the Page token. Such a connection must keep DMs disabled.
 
     Returns "" when no usable token exists, which callers must treat as "cannot
     connect this account" rather than substituting one.
@@ -969,6 +995,7 @@ def resolve_page_account_token(page: dict, platform: str, user_access_token: str
     return token or ""
 
 
+@transaction.atomic
 def _create_or_update_account(
     *,
     workspace_id,
@@ -979,17 +1006,46 @@ def _create_or_update_account(
     expires_in=None,
     instance_url="",
     webhook_target_id="",
+    facebook_user_access_token=None,
+    facebook_user_token_expires_at=None,
+    messaging_access=None,
+    authorizing_user=None,
 ):
     """Create or update a SocialAccount from OAuth results."""
     token_expires_at = None
     if expires_in:
         token_expires_at = timezone.now() + timedelta(seconds=expires_in)
 
+    analytics_defaults = {}
+    if platform == "youtube":
+        from apps.organizations.models import Organization
+
+        org = Organization.objects.select_for_update().get(workspaces__pk=workspace_id)
+        if org.is_deletion_pending:
+            raise PermissionDenied("Cancel organization deletion before reconnecting YouTube.")
+        analytics_defaults = {
+            "youtube_authorization_checked_at": timezone.now(),
+            "youtube_profile_refreshed_at": timezone.now(),
+        }
+        if authorizing_user is not None:
+            analytics_defaults["youtube_authorized_by"] = authorizing_user
+    if platform == "instagram" and facebook_user_access_token is not None:
+        from django.utils.dateparse import parse_datetime
+
+        if isinstance(facebook_user_token_expires_at, str):
+            facebook_user_token_expires_at = parse_datetime(facebook_user_token_expires_at)
+        analytics_defaults = {
+            "oauth_facebook_user_access_token": facebook_user_access_token,
+            "facebook_user_token_expires_at": facebook_user_token_expires_at,
+            "analytics_status": SocialAccount.AnalyticsStatus.CHECKING,
+        }
+
     account, created = SocialAccount.objects.update_or_create(
         workspace_id=workspace_id,
         platform=platform,
         account_platform_id=profile.platform_id,
         defaults={
+            **analytics_defaults,
             "account_name": profile.name,
             "account_handle": profile.handle or "",
             "avatar_url": profile.avatar_url or "",
@@ -999,6 +1055,7 @@ def _create_or_update_account(
             "token_expires_at": token_expires_at,
             "instance_url": instance_url,
             "webhook_target_id": webhook_target_id or "",
+            "messaging_access": messaging_access,
             "connection_status": SocialAccount.ConnectionStatus.CONNECTED,
             "last_error": "",
             # Fresh OAuth grant invalidates any prior analytics-scope failure.
@@ -1020,6 +1077,12 @@ def _create_or_update_account(
         from apps.calendar.services import create_default_queue_and_slots
 
         create_default_queue_and_slots(account)
+
+    if platform == "youtube":
+        from django.db.models import F
+
+        SocialAccount.objects.filter(pk=account.pk).update(youtube_data_generation=F("youtube_data_generation") + 1)
+        account.refresh_from_db()
 
     subscribe_account_webhooks_task(str(account.id))
 

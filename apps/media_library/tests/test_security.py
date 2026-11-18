@@ -75,15 +75,17 @@ class SniffIsoBmffBrandTest(SimpleTestCase):
     def _sniff(self, head):
         return sniff_mime(SimpleUploadedFile("f", head, content_type="application/octet-stream"))
 
-    def test_heic_and_heif_brands_are_images_not_video(self):
-        for brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"):
+    def test_heic_and_heif_brands_are_not_sniffed_as_video(self):
+        # sniff_mime returns None (hard reject) for still images; validate_file
+        # turns that into export advice (below).
+        for brand in (b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"):
             with self.subTest(brand=brand):
-                self.assertEqual(self._sniff(_ftyp(brand, b"mif1", b"heic")), "image/heic")
+                self.assertIsNone(self._sniff(_ftyp(brand, b"mif1", b"heic")))
 
-    def test_avif_brands_are_images_not_video(self):
+    def test_avif_brands_are_not_sniffed_as_video(self):
         for brand in (b"avif", b"avis"):
             with self.subTest(brand=brand):
-                self.assertEqual(self._sniff(_ftyp(brand, b"mif1", b"miaf")), "image/avif")
+                self.assertIsNone(self._sniff(_ftyp(brand, b"mif1", b"miaf")))
 
     def test_video_brands_stay_video(self):
         for brand in (b"isom", b"iso2", b"mp41", b"mp42", b"M4V ", b"avc1", b"dash"):

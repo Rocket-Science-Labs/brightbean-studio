@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import IO
 
 import httpx
 
-from .exceptions import APIError, ProviderError, RateLimitError
+from .exceptions import APIError, ProviderError, PublishError, RateLimitError
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -32,6 +33,10 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
+
+# Shown to the user as-is (a PublishError message passes through). Retryable,
+# so it must not promise anything that stops being true once retries run out.
+INTERRUPTED_WAIT_MESSAGE = "Publishing was interrupted by a restart while the platform was still processing the media."
 
 
 class SocialProvider(ABC):
@@ -414,6 +419,35 @@ class SocialProvider(ABC):
 
         return response
 
+    def _poll_until(
+        self,
+        check: Callable[[], bool],
+        *,
+        deadline: float,
+        interval: float,
+        on_timeout: Callable[[], Exception],
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
+        """Call ``check`` until it returns True, sleeping ``interval`` in between.
+
+        For platforms that process media after accepting it. ``check`` raises
+        for a terminal failure; ``deadline`` is a ``time.monotonic()`` value so
+        several waits can share one budget. When the worker is stopping, the
+        wait ends with a retryable error so the engine reschedules the attempt
+        before the platform's shutdown grace period runs out. That is checked
+        before every call to ``check``, including the first: ``check`` usually
+        makes a request, and one started after SIGTERM can by itself outlast
+        the grace period.
+        """
+        while True:
+            if should_stop is not None and should_stop():
+                raise PublishError(INTERRUPTED_WAIT_MESSAGE, platform=self.platform_name)
+            if check():
+                return
+            if time.monotonic() >= deadline:
+                raise on_timeout()
+            time.sleep(interval)
+
     def _error_for_response(self, response: httpx.Response) -> ProviderError:
         """Map an error response to the exception this provider wants raised.
 
@@ -430,7 +464,7 @@ class SocialProvider(ABC):
         """
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
-            logger.error("%s API 429 response: %s", self.platform_name, response.text[:1000])
+            logger.error("%s API request was rate limited (HTTP 429)", self.platform_name)
             return RateLimitError(
                 f"Rate limit exceeded for {self.platform_name}: {response.text[:500]}",
                 retry_after=int(retry_after) if retry_after else None,
