@@ -892,6 +892,13 @@ class ResolveLinkedInPostTypeTest(SimpleTestCase):
         for platform in ("linkedin_personal", "linkedin_company"):
             self.assertEqual(self._resolve(platform, 3, "gif"), PostType.MULTI_IMAGE)
 
+    def test_single_gif_is_an_image_post_not_text(self):
+        # Uploads store GIFs as "gif"; a lone one must not fall through to TEXT
+        # and publish the caption without the GIF.
+        for platform in ("linkedin_personal", "linkedin_company", "facebook", "mastodon"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self._resolve(platform, 1, "gif"), PostType.IMAGE)
+
     def test_instagram_and_threads_unchanged(self):
         self.assertEqual(self._resolve("instagram", 6, "image"), PostType.CAROUSEL)
         self.assertEqual(self._resolve("instagram_login", 2, "image"), PostType.CAROUSEL)

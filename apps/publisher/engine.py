@@ -991,7 +991,7 @@ class PublishEngine:
         4. LinkedIn: a document (PDF) → DOCUMENT; more than one image (or GIF)
            → MULTI_IMAGE (LinkedIn has no organic carousel, so these are its two
            multi-page formats)
-        5. Fallback: video → VIDEO (REEL on Instagram), image → IMAGE, else → TEXT
+        5. Fallback: video → VIDEO (REEL on Instagram), image or GIF → IMAGE, else → TEXT
         """
         # 1. Explicit post_type hint from platform_extra. LinkedIn has no organic
         #    carousel, so a "carousel" hint there means its multi-image post
@@ -1045,7 +1045,9 @@ class PublishEngine:
             if platform in ("instagram", "instagram_login"):
                 return PostType.REEL
             return PostType.VIDEO
-        if first_media_type == "image":
+        # Uploads store GIFs as "gif" (create_asset); a lone GIF is still an
+        # image post, not a caption-only TEXT post that drops the media.
+        if first_media_type in ("image", "gif"):
             return PostType.IMAGE
         return PostType.TEXT
 
