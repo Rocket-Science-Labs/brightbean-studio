@@ -79,7 +79,6 @@ UNSUPPORTED_MIME_MESSAGES = {
 }
 
 
-
 def determine_file_type(mime_type):
     """Map a MIME type to our FileType enum value."""
     return MIME_TO_FILE_TYPE.get(mime_type)
