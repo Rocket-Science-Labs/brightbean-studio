@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 MESSAGES_PER_PAGE = 50
 
 
-def _detail_context(workspace, message):
+def _detail_context(workspace, message, *, actor=None):
     """Build the full context needed for the message detail panel."""
     sla_config = InboxSLAConfig.objects.filter(workspace=workspace, is_active=True).first()
     saved_replies = SavedReply.objects.for_workspace(workspace.id)
@@ -70,6 +70,8 @@ def _detail_context(workspace, message):
         "reply_form": ReplyForm(),
         "note_form": InternalNoteForm(),
         "status_choices": InboxMessage.Status.choices,
+        "attachments": message.attachments,
+        "reply_eligibility": inbox_services.reply_eligibility(message, origin="web_inbox", actor=actor),
     }
 
 
@@ -202,7 +204,7 @@ def message_detail(request, workspace_id, message_id):
         message.status = InboxMessage.Status.OPEN
         message.save(update_fields=["status"])
 
-    context = _detail_context(workspace, message)
+    context = _detail_context(workspace, message, actor=request.user)
 
     if request.htmx:
         return render(request, "inbox/partials/_message_panel.html", context)
@@ -238,9 +240,11 @@ def send_reply(request, workspace_id, message_id):
     # A reply is only recorded if the platform accepted it. Recording it
     # regardless would show the team a sent reply the customer never got.
     try:
-        reply = inbox_services.send_reply(message=message, body=body, author=request.user)
+        reply = inbox_services.send_reply(message=message, body=body, author=request.user, origin="web_inbox")
     except Exception as exc:
-        logger.exception("Failed to send reply for message %s (%s)", message.id, account.platform)
+        logger.warning(
+            "Reply failed: message_id=%s platform=%s error_type=%s", message.id, account.platform, type(exc).__name__
+        )
         response = render(
             request,
             "inbox/partials/_reply_error.html",
@@ -280,7 +284,9 @@ def save_reply_draft(request, workspace_id, message_id):
         return HttpResponse(str(exc), status=400)
 
     message.refresh_from_db()
-    return render(request, "inbox/partials/_message_panel.html", _detail_context(workspace, message))
+    return render(
+        request, "inbox/partials/_message_panel.html", _detail_context(workspace, message, actor=request.user)
+    )
 
 
 @login_required
@@ -294,7 +300,7 @@ def send_reply_draft(request, workspace_id, reply_id):
 
     failed = False
     try:
-        inbox_services.send_reply_now(reply, actor=request.user)
+        inbox_services.send_reply_now(reply, actor=request.user, origin="web_inbox")
     except inbox_services.ReplyStateError as exc:
         return HttpResponse(str(exc), status=409)
     except Exception:
@@ -304,7 +310,9 @@ def send_reply_draft(request, workspace_id, reply_id):
         failed = True
 
     message.refresh_from_db()
-    panel = render(request, "inbox/partials/_message_panel.html", _detail_context(workspace, message))
+    panel = render(
+        request, "inbox/partials/_message_panel.html", _detail_context(workspace, message, actor=request.user)
+    )
     if failed:
         panel["HX-Reply-Failed"] = "1"
     return panel
@@ -325,7 +333,9 @@ def discard_reply_draft(request, workspace_id, reply_id):
         return HttpResponse(str(exc), status=409)
 
     message.refresh_from_db()
-    return render(request, "inbox/partials/_message_panel.html", _detail_context(workspace, message))
+    return render(
+        request, "inbox/partials/_message_panel.html", _detail_context(workspace, message, actor=request.user)
+    )
 
 
 # --- Internal Note ---
@@ -397,7 +407,7 @@ def assign_message(request, workspace_id, message_id):
             },
         )
 
-    context = _detail_context(workspace, message)
+    context = _detail_context(workspace, message, actor=request.user)
     return render(request, "inbox/partials/_message_panel.html", context)
 
 
@@ -419,7 +429,7 @@ def change_status(request, workspace_id, message_id):
     message.status = form.cleaned_data["status"]
     message.save(update_fields=["status"])
 
-    context = _detail_context(workspace, message)
+    context = _detail_context(workspace, message, actor=request.user)
     return render(request, "inbox/partials/_message_panel.html", context)
 
 

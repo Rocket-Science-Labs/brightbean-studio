@@ -25,27 +25,31 @@ from datetime import timedelta
 
 from background_task import background
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import F
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.common.db import in_worker_thread, release_idle_connection
+from apps.common.worker import SHUTDOWN_REQUESTED
 from apps.composer.models import PlatformPost
+from apps.composer.services import publish_blocker, usable_media_types
 from apps.credentials.models import resolve_platform_credentials
 from apps.media_library.storage import download_to_path
 from apps.social_accounts.error_messages import (
     FIRST_COMMENT_GENERIC_MESSAGE,
     PUBLISH_CONFIRM_TIMEOUT_MESSAGE,
-    PUBLISH_EXHAUSTED_MESSAGE,
     PUBLISH_GENERIC_MESSAGE,
     PUBLISH_INTERRUPTED_MESSAGE,
     PUBLISH_RATE_LIMIT_MESSAGE,
     PUBLISH_UNCONFIRMED_MESSAGE,
+    exhausted_publish_message,
     friendly_first_comment_error,
     friendly_publish_error,
+    is_credential_rejection,
 )
-from providers import get_provider
+from providers import VIDEO_POST_TYPES, get_provider
 from providers.exceptions import ProviderError, PublishError, RateLimitError
 from providers.types import PostType, PublishContent, PublishState
 
@@ -108,6 +112,10 @@ def _resolve_publish_credentials(account):
         credentials["page_id"] = account.account_platform_id
     elif platform in ("instagram", "instagram_login"):
         credentials["ig_user_id"] = account.account_platform_id
+        if platform == "instagram":
+            credentials["page_id"] = account.webhook_target_id
+            credentials["missing_scopes"] = account.missing_scopes
+            credentials["messaging_access"] = account.messaging_access
         # The comment poll and the first-comment reconciliation both match our
         # own comments on handle as well as id: Instagram often returns a
         # comment's ``username`` without a ``from`` object, and an unrecognised
@@ -323,12 +331,39 @@ def _provider_and_access_token(account):
     access_token = account.oauth_access_token
     if account.token_expires_within(_PUBLISH_REFRESH_WINDOW) and account.oauth_refresh_token:
         try:
-            access_token = account.refresh_oauth_token(provider)
+            access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
             logger.info("Refreshed token for %s", account)
         except Exception:
             logger.exception("Token refresh failed for %s", account)
 
     return provider, access_token
+
+
+class _ProviderUploadCache:
+    """The :class:`providers.types.UploadCache` the engine hands to providers.
+
+    Backed by the default cache (Redis in production, so it survives a worker
+    restart). Best-effort both ways: a cache outage costs a re-upload, never
+    a publish.
+    """
+
+    PREFIX = "provider-upload:"
+
+    def get(self, key: str) -> str | None:
+        try:
+            return cache.get(self.PREFIX + key)
+        except Exception:
+            logger.warning("Provider upload cache read failed", exc_info=True)
+            return None
+
+    def set(self, key: str, value: str, timeout: int) -> None:
+        try:
+            cache.set(self.PREFIX + key, value, timeout)
+        except Exception:
+            logger.warning("Provider upload cache write failed", exc_info=True)
+
+
+_provider_upload_cache = _ProviderUploadCache()
 
 
 @contextlib.contextmanager
@@ -655,7 +690,7 @@ class PublishEngine:
             )
 
             user_message = friendly_publish_error(e)
-            if getattr(e, "retryable", True):
+            if getattr(e, "retryable", True) and not _refused_a_live_token(platform_post.social_account, e):
                 self._schedule_retry(
                     platform_post,
                     error_msg,
@@ -700,6 +735,20 @@ class PublishEngine:
         """
         account = platform_post.social_account
         platform = account.platform
+        attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
+
+        # Every scheduled row passes through here, however it was scheduled, so
+        # this is where a post the platform can only refuse is stopped for
+        # certain — before a token refresh or a download, and with the sentence
+        # the scheduling paths show. They check first so the user hears it
+        # sooner; this is what keeps a path that forgot from mattering.
+        blocker = publish_blocker(
+            account,
+            media_types=usable_media_types(pm.media_asset for pm in attachments),
+            platform_extra=platform_post.platform_extra,
+        )
+        if blocker:
+            raise PublishError(blocker, platform=account.get_platform_display(), retryable=False)
 
         # Refreshes an expiring token first — covers OAuth2 providers *and*
         # session providers like Bluesky, whose accessJwt expires after only a
@@ -721,12 +770,11 @@ class PublishEngine:
         owns_cache = media_cache is None
         if owns_cache:
             media_cache = _SharedMediaCache()
-        attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
 
         # For video-only platforms (YouTube, TikTok), skip non-video attachments.
         # This runs before the document checks so a cross-platform post with a
         # video and a PDF still publishes the video here.
-        video_only = set(provider.supported_post_types) <= {PostType.VIDEO, PostType.SHORT}
+        video_only = set(provider.supported_post_types) <= VIDEO_POST_TYPES
         if video_only:
             attachments = [pm for pm in attachments if pm.media_asset.media_type == "video"]
 
@@ -870,6 +918,11 @@ class PublishEngine:
                 extra=extra,
                 link_url=link_url,
                 video_duration_sec=primary_video_duration,
+                # Stable per PlatformPost, so every retry of this row sends the
+                # same key; a clone or a new post is a new row and a new key.
+                idempotency_key=f"brightbean-{platform_post.id}",
+                upload_cache=_provider_upload_cache,
+                should_stop=SHUTDOWN_REQUESTED.is_set,
             )
 
             logger.info(
@@ -1111,13 +1164,13 @@ class PublishEngine:
     def _schedule_retry(self, platform_post, error_msg, *, user_message, retry_at=None):
         """Schedule a retry, honoring a provider's absolute reset time when given."""
         if platform_post.retry_count >= MAX_RETRIES:
-            # Not ``user_message``: everything that reaches this branch is a
-            # retryable failure whose copy promises "We'll retry shortly", and
-            # the post is about to be marked permanently failed.
+            # A "We'll retry shortly" must not outlive the last retry, but a
+            # specific message must not be swapped for a vaguer one either —
+            # exhausted_publish_message keeps whichever is true.
             self._fail_permanently(
                 platform_post,
                 error_msg,
-                user_message=PUBLISH_EXHAUSTED_MESSAGE,
+                user_message=exhausted_publish_message(user_message),
                 reason=f"after {MAX_RETRIES} retries",
             )
             return
@@ -1404,6 +1457,42 @@ class PublishEngine:
         if latest and post.published_at != latest:
             post.published_at = latest
             post.save(update_fields=["published_at", "updated_at"])
+
+
+def _refused_a_live_token(account, exc) -> bool:
+    """Whether the platform refused a token we know has not expired.
+
+    No retry fixes that: the grant was revoked, or never covered what the post
+    needs. Pinterest's missing boards:write was retried for an hour and a half
+    before anyone was told. An expired token is different — the refresh before
+    the next attempt may yet go through — and so is one whose expiry we never
+    recorded, because some platforms' tokens expire without telling us when.
+    Both keep their retries.
+    """
+    if not is_credential_rejection(exc):
+        return False
+    # Read the token back rather than trusting the copy this attempt loaded:
+    # another process may have rotated it mid-publish, and then the refusal was
+    # for a token nobody uses any more. The retry reloads the account and
+    # publishes with the new one.
+    from apps.social_accounts.models import SocialAccount
+
+    # Best-effort: this runs inside the publish path's except block, so a
+    # failed read must not escape it and strand the row in ``publishing``.
+    # Not knowing is the case that keeps its retries.
+    try:
+        stored = (
+            SocialAccount.objects.filter(pk=account.pk).values_list("oauth_access_token", "token_expires_at").first()
+        )
+    except Exception:
+        logger.warning("Could not re-read the token for %s; keeping the retry", account.pk, exc_info=True)
+        return False
+    if stored is None:
+        return False
+    token, expires_at = stored
+    if token != account.oauth_access_token:
+        return False
+    return expires_at is not None and expires_at > timezone.now()
 
 
 def _is_ambiguous_submission_failure(exc) -> bool:

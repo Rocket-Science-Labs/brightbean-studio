@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.test import Client
@@ -143,6 +143,37 @@ def draft_api(draft_only_key):
 # ---------------------------------------------------------------------------
 # List + read
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_rest_late_dm_retains_draft_and_cannot_claim_human_agent(api, message):
+    stamp = timezone.now() - timedelta(hours=30)
+    message.message_type = "dm"
+    message.sender_handle = "customer"
+    message.received_at = stamp
+    message.extra = {
+        "sender_id": "customer",
+        "platform_timestamp": stamp.isoformat(),
+        "attachments": [{"type": "image", "url": "https://cdn.example/image.jpg"}],
+    }
+    message.save()
+    provider = MagicMock()
+    with (
+        patch("apps.inbox.services.get_provider", return_value=provider),
+        patch("apps.publisher.engine._resolve_publish_credentials", return_value={"human_agent_enabled": True}),
+    ):
+        response = api.post(
+            f"/api/v1/inbox/{message.id}/replies",
+            data=json.dumps({"body": "Answer", "send": True, "human_agent": True}),
+            content_type="application/json",
+        )
+    assert response.status_code == 502
+    assert "web inbox" in response.json()["detail"]
+    provider.reply_to_message.assert_not_called()
+    assert InboxReply.objects.get(inbox_message=message).status == "failed"
+    response = api.get(f"/api/v1/inbox/{message.id}")
+    assert response.json()["attachments"] == [{"type": "image", "url": "https://cdn.example/image.jpg"}]
+    assert not response.json()["reply_eligibility"]["can_send"]
 
 
 @pytest.mark.django_db

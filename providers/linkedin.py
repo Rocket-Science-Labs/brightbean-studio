@@ -619,6 +619,7 @@ class LinkedInProvider(SocialProvider):
             raise PublishError(
                 "poll_options required in content.extra for LinkedIn poll posts",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         body = self._build_post_body(author, content.text)
@@ -1058,6 +1059,7 @@ class LinkedInProvider(SocialProvider):
             raise PublishError(
                 "No video source provided",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         url = content.media_urls[0]
@@ -1113,9 +1115,10 @@ class LinkedInProvider(SocialProvider):
         Videos and documents share the same status lifecycle:
         WAITING_UPLOAD -> PROCESSING -> AVAILABLE | PROCESSING_FAILED.
         """
-        deadline = time.monotonic() + timeout_seconds
         last_status: str | None = None
-        while True:
+
+        def available() -> bool:
+            nonlocal last_status
             resp = self._request(
                 "GET",
                 f"{API_BASE}/rest/{resource}/{_encode_urn(urn)}",
@@ -1124,8 +1127,6 @@ class LinkedInProvider(SocialProvider):
             )
             data = resp.json()
             status = data.get("status")
-            if status == "AVAILABLE":
-                return
             if status == "PROCESSING_FAILED":
                 raise PublishError(
                     f"LinkedIn rejected the {label} during processing: "
@@ -1134,12 +1135,17 @@ class LinkedInProvider(SocialProvider):
                     raw_response=data,
                 )
             last_status = status
-            if time.monotonic() >= deadline:
-                raise PublishError(
-                    f"Timed out waiting for LinkedIn {label} to become AVAILABLE (last status: {last_status})",
-                    platform=self.platform_name,
-                )
-            time.sleep(poll_interval)
+            return status == "AVAILABLE"
+
+        self._poll_until(
+            available,
+            deadline=time.monotonic() + timeout_seconds,
+            interval=poll_interval,
+            on_timeout=lambda: PublishError(
+                f"Timed out waiting for LinkedIn {label} to become AVAILABLE (last status: {last_status})",
+                platform=self.platform_name,
+            ),
+        )
 
     @staticmethod
     def _post_urn_to_url(urn: str) -> str | None:

@@ -29,7 +29,8 @@
         html.sidebar-is-collapsed .sidebar-initial .sidebar-section-label-wrap,
         html.sidebar-is-collapsed .sidebar-initial .sidebar-badge { display: none; }
         html.sidebar-is-collapsed .sidebar-initial .sidebar-new-label,
-        html.sidebar-is-collapsed .sidebar-initial .sidebar-connect-channels { display: none; }
+        html.sidebar-is-collapsed .sidebar-initial .sidebar-connect-channels,
+        html.sidebar-is-collapsed .sidebar-initial .sidebar-review-banner { display: none; }
         /* Collapsed child overrides before Alpine */
         html.sidebar-is-collapsed .sidebar-initial .sidebar-ws-btn { justify-content: center; padding-left: 0; padding-right: 0; gap: 0; }
         html.sidebar-is-collapsed .sidebar-initial .sidebar-new-wrap { padding-left: 0.5rem; padding-right: 0.5rem; }
@@ -661,7 +662,7 @@
                 </a>
 
                 {% if request.workspace %}
-                {% if analytics_enabled_platforms %}
+                {% if analytics_enabled_platforms and sidebar_can_view_analytics %}
                 <a href="{% url 'analytics:index' workspace_id=request.workspace.id %}" class="mb-1 sidebar-nav-item {% if request.resolver_match.app_name == 'analytics' %}active{% endif %}">
                     <svg class="flex-shrink-0" width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 12l4-4 4 4 6-6"/></svg>
                     <span class="sidebar-nav-label">Analytics</span>
@@ -697,18 +698,23 @@
                     </a>
                 </div>
                 {% for channel in sidebar_channels %}
-                <a href="{% url 'social_accounts:list' workspace_id=request.workspace.id %}" class="sidebar-nav-item" title="{{ channel.queued_post_count|default:0 }} upcoming post{{ channel.queued_post_count|default:0|pluralize }} in the queue for {{ channel.account_name|default:channel.account_handle }}">
+                <a href="{% url 'social_accounts:list' workspace_id=request.workspace.id %}" class="sidebar-nav-item" title="{% if channel.platform == 'youtube' %}YouTube · {% endif %}{{ channel.account_name|default:channel.account_handle }} · {{ channel.queued_post_count|default:0 }} upcoming post{{ channel.queued_post_count|default:0|pluralize }}">
                     <div class="relative flex-shrink-0">
                         {% if channel.avatar_url %}
                         <img src="{{ channel.avatar_url }}" alt="" class="w-7 h-7 rounded-full object-cover">
                         {% else %}
                         <div class="w-7 h-7 rounded-full bg-stone-200 flex items-center justify-center text-[11px] font-semibold text-stone-500">{{ channel.account_name|default:channel.account_handle|make_list|first|upper }}</div>
                         {% endif %}
-                        <div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
+                        {% if channel.platform != "youtube" %}<div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
                             {% include "partials/_platform_icon.html" with platform=channel.platform size="sm" %}
-                        </div>
+                        </div>{% endif %}
                     </div>
-                    <span class="sidebar-nav-label truncate">{{ channel.account_name|default:channel.account_handle }}</span>
+                    {% if channel.platform == "youtube" %}
+                    <span class="sidebar-nav-label min-w-0 flex-1" style="line-height:1.35;">
+                        <span class="block text-[11px] font-semibold text-stone-500">YouTube</span>
+                        <span class="block truncate">{{ channel.account_name|default:channel.account_handle }}</span>
+                    </span>
+                    {% else %}<span class="sidebar-nav-label truncate">{{ channel.account_name|default:channel.account_handle }}</span>{% endif %}
                     <span class="sidebar-badge">{{ channel.queued_post_count|default:0 }}</span>
                 </a>
                 {% endfor %}
@@ -723,11 +729,16 @@
                         {% else %}
                         <div class="w-7 h-7 rounded-full bg-stone-200 flex items-center justify-center text-[11px] font-semibold text-stone-500">{{ channel.account_name|default:channel.account_handle|make_list|first|upper }}</div>
                         {% endif %}
-                        <div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
+                        {% if channel.platform != "youtube" %}<div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
                             {% include "partials/_platform_icon.html" with platform=channel.platform size="sm" %}
-                        </div>
+                        </div>{% endif %}
                     </div>
-                    <span class="sidebar-nav-label truncate flex-1 text-stone-400 opacity-60">{{ channel.account_name|default:channel.account_handle }}</span>
+                    {% if channel.platform == "youtube" %}
+                    <span class="sidebar-nav-label min-w-0 flex-1 text-stone-400" style="line-height:1.35;">
+                        <span class="block text-[11px] font-semibold">YouTube</span>
+                        <span class="block truncate">{{ channel.account_name|default:channel.account_handle }}</span>
+                    </span>
+                    {% else %}<span class="sidebar-nav-label truncate flex-1 text-stone-400 opacity-60">{{ channel.account_name|default:channel.account_handle }}</span>{% endif %}
                     <form method="post" action="{% url 'social_accounts:reconnect' workspace_id=request.workspace.id account_id=channel.id %}" class="sidebar-nav-label">
                         {% csrf_token %}
                         <button type="submit" class="inline-flex items-center px-2 py-0.5 text-[11px] font-semibold text-orange-700 bg-orange-50 rounded-full hover:bg-orange-100 transition-colors cursor-pointer" title="Reconnect {{ channel.account_name|default:channel.account_handle }}">
@@ -745,7 +756,12 @@
                 <a href="{% url 'social_accounts:connect' workspace_id=request.workspace.id %}" class="sidebar-nav-item">
                     <div class="relative flex-shrink-0">
                         <div class="w-4 h-4 flex items-center justify-center rounded-lg bg-stone-100">
+                            {% if platform_key == 'youtube' %}
+                            {# Same generic video glyph as the connect page: no YouTube logo at this size (policy III.F.2.a). #}
+                            <svg class="w-3.5 h-3.5 text-stone-700" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75" d="M15.75 10.5l4.72-4.72a.75.75 0 011.28.53v11.38a.75.75 0 01-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 002.25-2.25v-9a2.25 2.25 0 00-2.25-2.25h-9A2.25 2.25 0 002.25 7.5v9a2.25 2.25 0 002.25 2.25z"/></svg>
+                            {% else %}
                             {% include "partials/_platform_icon.html" with platform=platform_key size="sm" %}
+                            {% endif %}
                         </div>
                         <div class="absolute -bottom-1 -right-1 w-2.5 h-2.5 rounded-full bg-orange-500 flex items-center justify-center ring-1 ring-white">
                             <svg viewBox="0 0 24 24" fill="none" width="6" height="6" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12H19M12 5V19"/></svg>
@@ -765,6 +781,10 @@
                 {% endif %}
                 {% endblock %}
             </nav>
+
+            {% if show_review_banner %}
+            {% include "partials/_review_banner.html" %}
+            {% endif %}
 
             <!-- Organization footer -->
             <div class="sidebar-org-footer border-t border-stone-100 relative px-3 py-3" x-data="{ orgMenuOpen: false }"
@@ -1005,7 +1025,11 @@
                         backgroundColor: gradient,
                         fill: true,
                         tension: 0.32,
-                        pointRadius: 0,
+                        pointRadius: canvas.dataset.platform === 'youtube' ? data.map(function(value, index) {
+                            // A reported day surrounded by gaps still needs a visible dot.
+                            return value !== null && (index === 0 || data[index - 1] === null)
+                                && (index === data.length - 1 || data[index + 1] === null) ? 3 : 0;
+                        }) : 0,
                         pointHoverRadius: 4,
                         pointHoverBackgroundColor: color,
                         borderWidth: 2,

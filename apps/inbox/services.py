@@ -14,14 +14,16 @@ to live in ``apps/inbox/views.py``; it moved here verbatim.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
 
 from providers import get_provider
+from providers.exceptions import MessagingError
+from providers.meta_messaging import META_DM_PLATFORMS
 
 from .models import InboxMessage, InboxReply, InboxSLAConfig
+from .reply_policy import PROGRAMMATIC, recipient_id, reply_eligibility
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +33,6 @@ _COMMENT_LIKE_TYPES = {
     InboxMessage.MessageType.MENTION,
     InboxMessage.MessageType.REVIEW,
 }
-
-# Past this age Meta only accepts a reply tagged as written by a person.
-HUMAN_AGENT_AFTER = timedelta(hours=24)
 
 # States a reply can be sent (or re-sent) from.
 _SENDABLE_STATUSES = {InboxReply.Status.DRAFT, InboxReply.Status.FAILED}
@@ -55,8 +54,14 @@ def reply_failure_reason(exc: Exception) -> str:
     raw API JSON) that mean nothing to a workspace member, so it stays in
     the log and the UI/API gets a stable sentence instead.
     """
+    import httpx
+
     from providers.exceptions import OAuthError, RateLimitError, TokenExpiredError
 
+    if isinstance(exc, MessagingError):
+        return str(exc)
+    if isinstance(exc, httpx.TransportError):
+        return "Delivery could not be confirmed. Check the conversation before retrying."
     if isinstance(exc, RateLimitError):
         return "the account has hit its rate limit. Wait a few minutes and try again."
     if isinstance(exc, TokenExpiredError | OAuthError):
@@ -64,7 +69,7 @@ def reply_failure_reason(exc: Exception) -> str:
     return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
 
 
-def _dispatch_to_platform(message: InboxMessage, body: str) -> str:
+def _dispatch_to_platform(message: InboxMessage, body: str, *, origin=PROGRAMMATIC, actor=None) -> str:
     """Post ``body`` back to the platform and return the platform's reply ID.
 
     Raises if the platform refuses it, so the caller can avoid recording a
@@ -73,13 +78,15 @@ def _dispatch_to_platform(message: InboxMessage, body: str) -> str:
     from apps.publisher.engine import _resolve_publish_credentials
 
     account = message.social_account
-    provider = get_provider(account.platform, _resolve_publish_credentials(account))
+    credentials = _resolve_publish_credentials(account)
+    provider = get_provider(account.platform, credentials)
 
     # The messaging endpoints address a person, not a message, so carry the
     # sender's platform-scoped ID alongside the original payload.
     extra = dict(message.extra or {})
-    if message.sender_handle:
-        extra.setdefault("recipient_id", message.sender_handle)
+    recipient = recipient_id(message)
+    if recipient:
+        extra.setdefault("recipient_id", recipient)
 
     if message.message_type in _COMMENT_LIKE_TYPES:
         result = provider.reply_to_comment(
@@ -89,15 +96,21 @@ def _dispatch_to_platform(message: InboxMessage, body: str) -> str:
             extra=extra,
         )
     else:
-        overdue = timezone.now() - message.received_at > HUMAN_AGENT_AFTER
+        policy = reply_eligibility(message, origin=origin, actor=actor, credentials=credentials)
+        if not policy["can_send"]:
+            raise MessagingError(policy["reason"], platform=account.platform)
         result = provider.reply_to_message(
             access_token=account.oauth_access_token,
             message_id=message.platform_message_id,
             text=body,
             extra=extra,
-            human_agent=overdue,
+            human_agent=policy["human_agent"],
         )
 
+    if message.message_type == "dm" and account.platform in META_DM_PLATFORMS and not result.platform_message_id:
+        raise MessagingError(
+            "Delivery could not be confirmed. Check the conversation before retrying.", platform=account.platform
+        )
     return result.platform_message_id
 
 
@@ -162,15 +175,14 @@ def discard_reply_draft(reply: InboxReply) -> None:
     reply.delete()
 
 
-def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
+def send_reply_now(reply: InboxReply, *, actor=None, origin=PROGRAMMATIC) -> InboxReply:
     """Deliver an existing draft/failed reply to the platform.
 
     On a platform refusal the row is kept and moved to ``failed`` with a
     human-readable ``send_error`` so the team can retry; the underlying
     exception is re-raised for the caller to shape into its own error.
-    ``NotImplementedError`` (provider has no reply API) is not a failure —
-    the reply is recorded locally with an empty ``platform_reply_id``,
-    matching the pre-existing behaviour.
+    Providers without a reply API retain the historical local-record behavior,
+    except Meta DMs: those must be confirmed by the platform before becoming sent.
     """
     failure = None
     with transaction.atomic():
@@ -185,20 +197,27 @@ def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
             reply.author = actor
 
         try:
-            platform_reply_id = _dispatch_to_platform(message, reply.body)
-        except NotImplementedError:
-            logger.info(
-                "Provider %s cannot send replies; recording reply %s locally.",
-                message.social_account.platform,
-                reply.id,
-            )
-            platform_reply_id = ""
+            platform_reply_id = _dispatch_to_platform(message, reply.body, origin=origin, actor=actor)
         except Exception as exc:
-            logger.exception("Failed to send inbox reply %s (%s)", reply.id, message.social_account.platform)
-            reply.status = InboxReply.Status.FAILED
-            reply.send_error = reply_failure_reason(exc)
-            reply.save(update_fields=["status", "send_error", "author", "updated_at"])
-            failure = exc
+            if isinstance(exc, NotImplementedError) and not (
+                message.message_type == "dm" and message.social_account.platform in META_DM_PLATFORMS
+            ):
+                platform_reply_id = ""
+            else:
+                if isinstance(exc, NotImplementedError):
+                    exc = MessagingError(
+                        "This connection cannot send DMs. Reconnect the account or check its configuration."
+                    )
+                logger.warning(
+                    "Inbox reply failed: reply_id=%s platform=%s error_type=%s",
+                    reply.id,
+                    message.social_account.platform,
+                    type(exc).__name__,
+                )
+                reply.status = InboxReply.Status.FAILED
+                reply.send_error = reply_failure_reason(exc)
+                reply.save(update_fields=["status", "send_error", "author", "updated_at"])
+                failure = exc
 
         if failure is None:
             reply.status = InboxReply.Status.SENT
@@ -218,17 +237,17 @@ def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
     return reply
 
 
-def send_reply(*, message: InboxMessage, body: str, author=None) -> InboxReply:
+def send_reply(*, message: InboxMessage, body: str, author=None, origin=PROGRAMMATIC) -> InboxReply:
     """Create a reply and send it in one step (the classic composer flow).
 
-    If the platform refuses it, the ``failed`` row is removed and the
-    exception propagates — the thread must never show a reply the customer
-    never received. ``NotImplementedError`` keeps the local record.
+    Refused Meta DM replies are retained as failed drafts for human review.
+    Other providers retain their existing failed-row cleanup behavior.
     """
     with transaction.atomic():
         reply = create_reply_draft(message=message, body=body, author=author)
     try:
-        return send_reply_now(reply, actor=author)
+        return send_reply_now(reply, actor=author, origin=origin)
     except Exception:
-        InboxReply.objects.filter(pk=reply.pk, status=InboxReply.Status.FAILED).delete()
+        if not (message.message_type == "dm" and message.social_account.platform in META_DM_PLATFORMS):
+            InboxReply.objects.filter(pk=reply.pk, status=InboxReply.Status.FAILED).delete()
         raise

@@ -96,6 +96,7 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "csp.middleware.CSPMiddleware",
+    "apps.api.usage.CountUncountedApiCallsMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -260,6 +261,69 @@ ACCOUNT_EMAIL_SUBJECT_PREFIX = ""
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
 LOGIN_REDIRECT_URL = "/"
 ACCOUNT_LOGOUT_REDIRECT_URL = "/accounts/login/"
+# Where "Sign up" links send people instead of Studio's own /accounts/signup/
+# (see apps/accounts/signup_links.py). Empty keeps the built-in signup.
+CUSTOM_SIGNUP_URL = env("CUSTOM_SIGNUP_URL", default="").strip()
+# Raised at boot rather than rendered: a value like "example.com/join" would
+# resolve relative to the login page and 404, and an unquoted "# comment" after
+# the value in .env is kept by read_env and would end up inside the href.
+if CUSTOM_SIGNUP_URL and (
+    not CUSTOM_SIGNUP_URL.startswith(("https://", "http://", "/")) or any(c.isspace() for c in CUSTOM_SIGNUP_URL)
+):
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        "CUSTOM_SIGNUP_URL must be an http(s):// URL or a path starting with /, "
+        "without spaces (put .env comments on their own line)."
+    )
+
+# Who may create an account. Applies to both the email form and social
+# logins; signing in with an existing account is never affected.
+#
+#   open    anyone can sign up (default — unchanged behaviour)
+#   invite  only visitors who followed a valid invitation link
+#   closed  nobody; accounts are created in the Django admin
+#
+# A deployment reachable from the internet — which it has to be, so the
+# platforms can deliver OAuth callbacks and webhooks — is open to the world
+# on "open". Self-hosters usually want "invite".
+SIGNUP_MODE = env("SIGNUP_MODE", default="open").strip().lower()
+if SIGNUP_MODE not in {"open", "invite", "closed"}:
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        f"SIGNUP_MODE must be one of open, invite, closed — got {SIGNUP_MODE!r}. "
+        "Refusing to guess, because falling back to a default would silently "
+        "leave signup open."
+    )
+# Outside open mode, visitors who may not sign up are redirected from
+# /accounts/signup/ to CUSTOM_SIGNUP_URL — pointing it back there would loop.
+# "This site" is APP_URL's host or any ALLOWED_HOSTS entry ("." prefix matches
+# subdomains); hostnames compare case-insensitively, ports are ignored.
+_custom_signup = urlparse(CUSTOM_SIGNUP_URL)
+_custom_signup_host = _custom_signup.hostname or ""
+
+
+def _is_own_host(host):
+    if not host:
+        return True
+    for pattern in [urlparse(APP_URL).hostname or "", *(h.lower() for h in ALLOWED_HOSTS)]:
+        if host == pattern or (pattern.startswith(".") and (host == pattern[1:] or host.endswith(pattern))):
+            return True
+    return False
+
+
+if (
+    SIGNUP_MODE != "open"
+    and _custom_signup.path.rstrip("/") == "/accounts/signup"
+    and _is_own_host(_custom_signup_host)
+):
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        f"CUSTOM_SIGNUP_URL points at Studio's own signup page, which redirects to "
+        f"CUSTOM_SIGNUP_URL when SIGNUP_MODE={SIGNUP_MODE}. Leave it empty or point it elsewhere."
+    )
 
 AUTHENTICATION_BACKENDS = [
     "django.contrib.auth.backends.ModelBackend",
@@ -348,7 +412,7 @@ CSP_STYLE_SRC = ("'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net")
 CSP_IMG_SRC = ("'self'", "data:", "blob:", "https:")
 CSP_FONT_SRC = ("'self'",)
 CSP_CONNECT_SRC = ("'self'", "https://cdn.jsdelivr.net")
-CSP_MEDIA_SRC = ("'self'", "blob:")
+CSP_MEDIA_SRC = ("'self'", "blob:", "https:")
 CSP_FORM_ACTION = (
     "'self'",
     "https://accounts.google.com",
@@ -437,12 +501,14 @@ if SENTRY_DSN:
     )
 
 # Platform credentials env vars (cloud version)
+PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = env.bool("PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED", default=True)
 _META_CREDENTIALS = {
     "app_id": env("PLATFORM_FACEBOOK_APP_ID", default=""),
     "app_secret": env("PLATFORM_FACEBOOK_APP_SECRET", default=""),
     # Optional Facebook Login for Business configuration. When present Meta
     # controls the permission and business-asset selection through this config.
     "config_id": env("PLATFORM_FACEBOOK_CONFIG_ID", default=""),
+    "human_agent_enabled": env.bool("PLATFORM_FACEBOOK_HUMAN_AGENT_ENABLED", default=False),
 }
 _GOOGLE_CREDENTIALS = {
     "client_id": env("PLATFORM_GOOGLE_CLIENT_ID", default=""),
@@ -451,6 +517,7 @@ _GOOGLE_CREDENTIALS = {
 _INSTAGRAM_LOGIN_CREDENTIALS = {
     "app_id": env("PLATFORM_INSTAGRAM_APP_ID", default=""),
     "app_secret": env("PLATFORM_INSTAGRAM_APP_SECRET", default=""),
+    "human_agent_enabled": env.bool("PLATFORM_INSTAGRAM_HUMAN_AGENT_ENABLED", default=False),
 }
 # Threads has its own app identity: a Meta app carrying the "Access the Threads
 # API" use case gets a Threads App ID / Secret distinct from the Facebook pair
@@ -569,8 +636,9 @@ PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_
 # different in kind: its Data API grants 10,000 units a DAY to the whole OAuth
 # client, shared by every connected channel, and a comment poll costs a unit per
 # page. Ten channels at the 5-minute cadence spend the day's budget before noon
-# — and when it is gone, publishing, analytics and even reconnecting an account
-# stop until midnight US/Pacific. So YouTube gets its own floor.
+# — and when it is gone, analytics, reconnecting an account, and the thumbnails
+# and first comments of new videos stop until midnight US/Pacific. (Uploads
+# carry on: ``videos.insert`` has its own bucket.) So YouTube gets its own floor.
 #
 # This is enforced per account against ``inbox_last_polled_at`` rather than by
 # slowing the cycle, because the cycle serves every platform at once. (It also
@@ -591,6 +659,7 @@ INBOX_DEEP_SWEEP_SECONDS = env.int("INBOX_DEEP_SWEEP_SECONDS", default=7 * 24 * 
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = env("FACEBOOK_WEBHOOK_VERIFY_TOKEN", default="")
 INSTAGRAM_LOGIN_WEBHOOK_VERIFY_TOKEN = env("INSTAGRAM_LOGIN_WEBHOOK_VERIFY_TOKEN", default="")
 YOUTUBE_WEBHOOK_SECRET = env("YOUTUBE_WEBHOOK_SECRET", default="")
+YOUTUBE_COMPLIANCE_ENFORCEMENT = env.bool("YOUTUBE_COMPLIANCE_ENFORCEMENT", default=False)
 
 # Rate limiting
 RATELIMIT_ENABLE = not DEBUG

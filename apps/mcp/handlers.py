@@ -210,11 +210,13 @@ register_tool(
         description=(
             "List the social media accounts this API key is allowed to act on. "
             "Returns id, platform, account_name, account_handle, connection_status, char_limit, "
-            "escaped_chars, needs_title, and supports_first_comment. Call this first to discover which "
+            "escaped_chars, needs_title, supports_first_comment, requires_video, and requires_media. "
+            "Call this first to discover which "
             "social_account_id values are valid and what each platform requires."
         ),
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_list_accounts,
+        read_only=True,
     )
 )
 
@@ -359,7 +361,10 @@ register_tool(
         name="schedule_post",
         description=(
             "Create a post and schedule it to publish at a specific UTC timestamp. "
-            "The publisher polls every ~15s and will fire the post once the time elapses."
+            "The publisher polls every ~15s and will fire the post once the time elapses. "
+            "Refused when the post can't publish: accounts with requires_video need a video in "
+            "media_asset_ids, those with requires_media need at least one media item, and "
+            "Pinterest needs a board, which only the composer can set (use create_draft for Pinterest)."
         ),
         input_schema={
             "type": "object",
@@ -420,6 +425,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_post,
+        read_only=True,
     )
 )
 
@@ -508,6 +514,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_list_posts,
+        read_only=True,
     )
 )
 
@@ -629,7 +636,10 @@ register_tool(
             "Schedule an EXISTING draft post — transitions every draft child to scheduled "
             "at the given UTC timestamp. Use this for the two-step flow "
             "'create_draft now, schedule_draft later'. For one-shot create-and-schedule, "
-            "use schedule_post instead. Requires both create_posts and publish_directly."
+            "use schedule_post instead. Requires both create_posts and publish_directly. "
+            "Refused when the post can't publish: accounts with requires_video need a video "
+            "attached, those with requires_media need at least one media item, and a Pinterest "
+            "draft needs a board chosen in the composer."
         ),
         input_schema={
             "type": "object",
@@ -752,6 +762,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_search_media,
+        read_only=True,
     )
 )
 
@@ -786,6 +797,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_media,
+        read_only=True,
     )
 )
 
@@ -1140,7 +1152,12 @@ register_tool(
             "(views/likes/reach/etc.), an engagement-rate card when the platform supports it, "
             "and follower growth. Each metric is returned as ``{value, delta, series, kind}`` "
             "where ``delta`` is the percent change vs. the prior equal-length window and "
-            "``series`` is the daily sparkline. Includes ``captured_at`` and ``next_sync_eta`` "
+            "``series`` is the daily sparkline. Metrics with ``calculated_by_brightbean: true`` (the "
+            "engagement rate, daily averages, estimates) and every ``delta`` are calculated by BrightBean, "
+            "not reported by the platform; say so when showing them to a user. Includes ``captured_at`` and ``next_sync_eta`` "
+            "YouTube uses native period reports, separate raw count cards, ``engagement: null``, Pacific reporting-period metadata "
+            "and ``comparison_available``. Missing numeric metrics are omitted and daily gaps remain null. "
+            "Disclosure alone does not permit additional derived YouTube analytics. "
             "so an agent can pick a sensible poll delay. Platforms without an analytics surface "
             "(LinkedIn Personal, Bluesky, Mastodon) return ``analytics_available: false`` with "
             "``unavailable_reason``. Requires the view_analytics permission."
@@ -1165,6 +1182,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_account_analytics,
+        read_only=True,
     )
 )
 
@@ -1216,6 +1234,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_post_analytics,
+        read_only=True,
     )
 )
 
@@ -1363,6 +1382,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_list_inbox_messages,
+        read_only=True,
     )
 )
 
@@ -1395,6 +1415,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_inbox_message,
+        read_only=True,
     )
 )
 

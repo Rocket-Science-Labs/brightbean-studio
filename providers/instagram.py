@@ -12,7 +12,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 from .base import SocialProvider
-from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .exceptions import APIError, MessagingError, OAuthError, ProviderError, PublishError, WebhookChannelError
 from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import (
     fetch_instagram_comments,
@@ -20,6 +20,17 @@ from .meta_comments import (
     resolve_comment_reply_target,
 )
 from .meta_insights import fetch_insights_safe
+from .meta_messaging import (
+    InstagramMessageBatch,
+    build_send_payload,
+    enabled,
+    fetch_instagram_page_messages,
+    merge_page_message_subscription,
+    meta_subscription_needs_reconnect,
+    require_message_id,
+    resolve_recipient_id,
+    validate_instagram_text,
+)
 from .meta_oauth import facebook_login_params
 from .types import (
     AccountMetrics,
@@ -48,16 +59,8 @@ TOKEN_URL = f"{BASE_URL}/oauth/access_token"
 # "(#100) Param subscribed_fields[0] must be one of {...}". Sending them to the
 # Page is what left every Instagram inbox deaf to comments.
 #
-# The Page is also the wrong object on permissions: POST /{page-id}/subscribed_apps
-# needs ``pages_manage_metadata``, which this OAuth flow never requests, while
-# the Instagram user's edge is covered by the ``instagram_*`` scopes it does.
-# And ``subscribed_apps`` *replaces* a field list rather than merging into it,
-# so writing the Page from here would silently drop the mention and message
-# subscriptions of a Facebook Page connected in the same workspace.
-#
-# ``messages`` is deliberately absent: this OAuth flow does not request
-# ``instagram_manage_messages``, so Meta would reject the subscription and any
-# DM call. Instagram DMs are served by the Instagram-Login connection instead.
+# Messaging is subscribed separately on the linked Page. Its field list must
+# be merged so connecting Instagram never removes Facebook's feed/mention fields.
 INSTAGRAM_WEBHOOK_FIELDS = ["comments", "mentions"]
 INSTAGRAM_ACCOUNT_INSIGHTS = [
     "reach",
@@ -89,7 +92,7 @@ INSTAGRAM_MEDIA_FIELDS = [
 
 # Polling settings for container status checks
 CONTAINER_POLL_INTERVAL = 2  # seconds
-CONTAINER_POLL_MAX_ATTEMPTS = 60
+CONTAINER_POLL_TIMEOUT = 120  # seconds
 
 
 class InstagramProvider(SocialProvider):
@@ -143,8 +146,27 @@ class InstagramProvider(SocialProvider):
             "instagram_content_publish",
             "instagram_manage_comments",
             "instagram_manage_insights",
+            "instagram_manage_messages",
             "pages_show_list",
             "pages_read_engagement",
+            "pages_manage_metadata",
+        ]
+
+    @property
+    def dm_oauth_scopes_enabled(self) -> bool:
+        return enabled(self.credentials.get("dm_oauth_scopes_enabled", True))
+
+    @property
+    def oauth_scopes(self) -> list[str]:
+        """Request messaging by default unless the deployment opts out.
+
+        Keep required_scopes complete: grant readback and existing DM access
+        must continue to depend on the token, not this permission-request setting.
+        """
+        return [
+            scope
+            for scope in self.required_scopes
+            if scope != "instagram_manage_messages" or self.dm_oauth_scopes_enabled
         ]
 
     @property
@@ -165,7 +187,7 @@ class InstagramProvider(SocialProvider):
             client_id=self.credentials["client_id"],
             redirect_uri=redirect_uri,
             state=state,
-            scopes=self.required_scopes,
+            scopes=self.oauth_scopes,
             config_id=str(self.credentials.get("config_id") or "").strip(),
         )
         return f"{OAUTH_URL}?{urlencode(params)}"
@@ -288,6 +310,7 @@ class InstagramProvider(SocialProvider):
                 "page_name": page.get("name", ""),
                 "tasks": page.get("tasks") or [],
                 "can_publish": page_can_publish(page),
+                "can_message": "MESSAGING" in page["tasks"] if "tasks" in page else None,
             }
             page_token = page.get("access_token")
             if page_token:
@@ -304,6 +327,7 @@ class InstagramProvider(SocialProvider):
             raise PublishError(
                 "Instagram requires at least one media item",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         ig_user_id = content.extra.get("ig_user_id") or self._get_ig_user_id(access_token)
@@ -401,7 +425,8 @@ class InstagramProvider(SocialProvider):
 
     def _wait_for_container(self, access_token: str, container_id: str) -> None:
         """Poll container status until FINISHED or error."""
-        for _ in range(CONTAINER_POLL_MAX_ATTEMPTS):
+
+        def finished() -> bool:
             resp = self._request(
                 "GET",
                 f"{BASE_URL}/{container_id}",
@@ -410,21 +435,19 @@ class InstagramProvider(SocialProvider):
             )
             data = resp.json()
             status = data.get("status_code", "")
-
-            if status == "FINISHED":
-                return
             if status == "ERROR":
                 raise PublishError(
                     f"Instagram container failed: {data.get('status', 'unknown error')}",
                     platform=self.platform_name,
                     raw_response=data,
                 )
+            return status == "FINISHED"
 
-            time.sleep(CONTAINER_POLL_INTERVAL)
-
-        raise PublishError(
-            "Instagram container processing timed out",
-            platform=self.platform_name,
+        self._poll_until(
+            finished,
+            deadline=time.monotonic() + CONTAINER_POLL_TIMEOUT,
+            interval=CONTAINER_POLL_INTERVAL,
+            on_timeout=lambda: PublishError("Instagram container processing timed out", platform=self.platform_name),
         )
 
     def _publish_container(self, access_token: str, ig_user_id: str, container_id: str) -> PublishResult:
@@ -494,6 +517,7 @@ class InstagramProvider(SocialProvider):
             access_token=access_token,
             metrics=INSTAGRAM_MEDIA_INSIGHTS,
             endpoint_type="media",
+            require_success=True,
         )
         likes = values.get("likes", fields.get("like_count", 0))
         comments = values.get("comments", fields.get("comments_count", 0))
@@ -534,6 +558,7 @@ class InstagramProvider(SocialProvider):
                 "total_interactions": {"metric_type": "total_value"},
             },
             endpoint_type="account",
+            require_success=True,
         )
         profile = self._get_profile_fields(access_token, ig_user_id)
         # ``None`` means the fetch FAILED (vs a real 0): leave followers unset so
@@ -556,20 +581,65 @@ class InstagramProvider(SocialProvider):
     # Inbox
     # ------------------------------------------------------------------
 
-    # Instagram DMs are not available on this connection: the Facebook-Login
-    # flow does not request ``instagram_manage_messages``, so
-    # ``reply_to_message`` stays unimplemented and this account never appears in
-    # the DM surface. Accounts connected via Instagram Login do support them.
-
     def get_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        messages = InstagramMessageBatch()
+        failures = []
+        for label, fetch in (("comment", self._fetch_media_comments), ("DM", self._fetch_direct_messages)):
+            try:
+                batch = fetch(access_token, since)
+                messages.extend(batch)
+                if isinstance(batch, InstagramMessageBatch):
+                    messages.poll_state = batch.poll_state
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning("Instagram %s poll failed: error_type=%s", label, type(exc).__name__)
+        if failures and not messages and messages.poll_state is None:
+            raise failures[0]
+        return messages
+
+    def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        page_id = self.credentials.get("page_id")
+        # Legacy comment-only connections can still sync their comments.
+        if not page_id or self.credentials.get("messaging_access") is False:
+            return []
+        if "instagram_manage_messages" in self.credentials.get("missing_scopes", []):
+            return []
+        return fetch_instagram_page_messages(
+            self._request,
+            base_url=BASE_URL,
+            page_id=page_id,
+            owner_id=self.credentials.get("ig_user_id"),
+            access_token=access_token,
+            since=since,
+            poll_state=self.credentials.get("instagram_dm_poll_state"),
+        )
+
+    def reply_to_message(
+        self, access_token: str, message_id: str, text: str, extra: dict | None = None, *, human_agent: bool = False
+    ) -> ReplyResult:
+        page_id = self.credentials.get("page_id")
+        recipient_id = resolve_recipient_id(extra)
+        if not page_id:
+            raise MessagingError(
+                "Reconnect Instagram to obtain its linked Page and Page token.", platform=self.platform_name
+            )
+        if not recipient_id:
+            raise MessagingError(
+                "The original message is missing its Instagram-scoped sender ID.", platform=self.platform_name
+            )
+        validate_instagram_text(text, platform=self.platform_name)
+        data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/messages",
+            access_token=access_token,
+            json=build_send_payload(recipient_id, text, human_agent=human_agent),
+        ).json()
+        return ReplyResult(platform_message_id=require_message_id(data, platform=self.platform_name), extra=data)
+
+    def _fetch_media_comments(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
         """Poll comments on the account's recent media.
 
-        Instagram comments have only ever reached the inbox by webhook, and that
-        webhook is subscribed on the *linked Page* (see ``subscribe_webhooks``)
-        — an object this app cannot confirm is delivering anything. An account
-        whose subscription never took is deaf to comments permanently with no
-        way to backfill; this poll is the backstop, exactly as FacebookProvider
-        does for a Page feed.
+        Polling is the fallback for missed or unavailable comment webhooks.
         """
         ig_user_id = str(self.credentials.get("ig_user_id") or "")
         if not ig_user_id:
@@ -606,6 +676,38 @@ class InstagramProvider(SocialProvider):
         )
         data = resp.json()
         return ReplyResult(platform_message_id=data.get("id", ""), extra=data)
+
+    def inspect_token(self, access_token: str) -> dict | None:
+        """Inspect credential identity without confusing Page scopes with consent."""
+        client_id = self.credentials.get("client_id")
+        client_secret = self.credentials.get("client_secret")
+        if not client_id or not client_secret:
+            return None
+        resp = self._request(
+            "GET",
+            f"{BASE_URL}/debug_token",
+            params={"input_token": access_token, "access_token": f"{client_id}|{client_secret}"},
+        )
+        return resp.json().get("data") or None
+
+    def get_user_granted_scopes(self, user_access_token: str = "", *, user_id: str = "") -> set[str] | None:
+        """Read the person's consent, using their token or an app-authorized ID."""
+        access_token = user_access_token
+        target = "me"
+        if user_id:
+            client_id = self.credentials.get("client_id")
+            client_secret = self.credentials.get("client_secret")
+            if not client_id or not client_secret:
+                return None
+            access_token = f"{client_id}|{client_secret}"
+            target = user_id
+        if not access_token:
+            return None
+        resp = self._request("GET", f"{BASE_URL}/{target}/permissions", access_token=access_token)
+        data = resp.json().get("data")
+        if not isinstance(data, list):
+            return None
+        return {row["permission"] for row in data if row.get("status") == "granted" and row.get("permission")}
 
     def get_granted_scopes(self, access_token: str) -> set[str] | None:
         """Read the grant back by inspecting the token itself.
@@ -666,13 +768,60 @@ class InstagramProvider(SocialProvider):
         cannot carry these fields. The app must also be subscribed to the
         Instagram object in the Meta App Dashboard; no API call can set that.
         """
-        resp = self._request(
-            "POST",
-            f"{BASE_URL}/{account_id}/subscribed_apps",
-            access_token=access_token,
-            params={"subscribed_fields": ",".join(INSTAGRAM_WEBHOOK_FIELDS)},
-        )
-        return bool(resp.json().get("success"))
+        failures = []
+        needs_reconnect = False
+        try:
+            resp = self._request(
+                "POST",
+                f"{BASE_URL}/{account_id}/subscribed_apps",
+                access_token=access_token,
+                params={"subscribed_fields": ",".join(INSTAGRAM_WEBHOOK_FIELDS)},
+            )
+            if not resp.json().get("success"):
+                failures.append("Comment/mention notifications were not enabled.")
+        except Exception as exc:
+            needs_reconnect |= meta_subscription_needs_reconnect(exc)
+            failures.append(
+                "Comment/mention notifications failed. Reconnect Instagram to restore comment permissions."
+                if needs_reconnect
+                else "Comment/mention notifications failed. Try again."
+            )
+        page_id = self.credentials.get("page_id")
+        if page_id:
+            missing = set(self.credentials.get("missing_scopes", []))
+            if "pages_manage_metadata" in missing:
+                failures.append("DM notifications require Page metadata permissions. Reconnect Instagram.")
+                needs_reconnect = True
+            elif "instagram_manage_messages" in missing and not self.dm_oauth_scopes_enabled:
+                # The account cannot grant a permission we deliberately omit.
+                # Keep its comment subscription without prompting a reconnect.
+                pass
+            elif "instagram_manage_messages" in missing or self.credentials.get("messaging_access") is False:
+                failures.append(
+                    "DM notifications require messaging permissions and Page messaging access. Reconnect Instagram."
+                )
+                needs_reconnect = True
+            else:
+                try:
+                    if not merge_page_message_subscription(
+                        self._request,
+                        base_url=BASE_URL,
+                        page_id=page_id,
+                        access_token=access_token,
+                        app_id=self.credentials.get("client_id"),
+                    ):
+                        failures.append("DM notifications could not be confirmed on the linked Page.")
+                except Exception as exc:
+                    dm_needs_reconnect = meta_subscription_needs_reconnect(exc)
+                    needs_reconnect |= dm_needs_reconnect
+                    failures.append(
+                        "DM notifications failed. Check messaging permissions and reconnect Instagram."
+                        if dm_needs_reconnect
+                        else "DM notifications failed. Try again."
+                    )
+        if failures:
+            raise WebhookChannelError(" ".join(failures), platform=self.platform_name, needs_reconnect=needs_reconnect)
+        return True
 
     def unsubscribe_webhooks(self, access_token: str, account_id: str) -> bool:
         resp = self._request(
@@ -680,7 +829,11 @@ class InstagramProvider(SocialProvider):
             f"{BASE_URL}/{account_id}/subscribed_apps",
             access_token=access_token,
         )
-        return bool(resp.json().get("success"))
+        success = bool(resp.json().get("success"))
+        page_id = self.credentials.get("page_id")
+        if page_id and not self.credentials.get("preserve_page_subscription"):
+            self._request("DELETE", f"{BASE_URL}/{page_id}/subscribed_apps", access_token=access_token)
+        return success
 
     # ------------------------------------------------------------------
     # Helpers

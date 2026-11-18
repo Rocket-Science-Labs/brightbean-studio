@@ -336,6 +336,63 @@ def _provider(*, batch_size=1):
 
 
 @pytest.mark.django_db
+class TestYouTubePostGeneration:
+    @pytest.mark.parametrize("path", ["analytics", "batch", "individual", "single"])
+    @pytest.mark.parametrize("renew_during_request", [False, True])
+    def test_response_uses_the_generation_of_its_grant(self, workspace, path, renew_during_request):
+        from apps.analytics.models import PostInsightsSnapshot
+        from apps.analytics.tasks import _sync_account_posts, _sync_post_metrics, _sync_youtube_post_analytics
+        from apps.composer.models import PlatformPost
+        from providers.types import PostMetrics
+
+        account = _youtube_account(workspace, platform_id="yt-generation", needs_reconnect=False)
+        created = _published_post(account)
+        # The account loop fetches posts without caching their SocialAccount.
+        post = PlatformPost.objects.get(pk=created.pk)
+        today = timezone.now().date()
+        provider = _provider(batch_size=50 if path == "batch" else 1)
+        metrics = PostMetrics(video_views=5, extra={"watch_time": 42, "avg_view_pct": 72.4})
+
+        def fetched(*args, **kwargs):
+            if renew_during_request:
+                SocialAccount.objects.filter(pk=account.pk).update(
+                    youtube_data_generation=account.youtube_data_generation + 1,
+                    oauth_access_token="renewed-token",
+                )
+                # Simulate newer snapshots arriving before the old request returns.
+                for key in ("views", "watch_time"):
+                    PostInsightsSnapshot.objects.create(platform_post=post, metric_key=key, date=today, value=900)
+            if path in {"analytics", "batch"}:
+                return {post.platform_post_id: metrics}
+            return metrics
+
+        if path == "analytics":
+            provider.get_post_analytics.side_effect = fetched
+            _sync_youtube_post_analytics(account, provider, "old-token", today)
+        elif path == "single":
+            provider.get_post_metrics.side_effect = fetched
+            _sync_post_metrics(post, today, provider=provider, access_token="old-token")
+        else:
+            if path == "batch":
+                provider.get_post_metrics_batch.side_effect = fetched
+            else:
+                provider.get_post_metrics.side_effect = fetched
+            _sync_account_posts(account, provider, "old-token", [post], today)
+
+        actual = dict(PostInsightsSnapshot.objects.filter(platform_post=post).values_list("metric_key", "value"))
+        expected = (
+            {"views": 900.0, "watch_time": 900.0}
+            if renew_during_request
+            else {
+                "views": 5.0,
+                "watch_time": 42.0,
+                "avg_view_pct": 72.4,
+            }
+        )
+        assert actual == expected
+
+
+@pytest.mark.django_db
 class TestFailureBackoff:
     """Regression cover for the YouTube quota storm.
 
@@ -566,6 +623,130 @@ class TestBatching:
 
 
 @pytest.mark.django_db
+class TestBatchFill:
+    """A call that is going out anyway carries the posts due next, for no extra unit."""
+
+    def _post(self, account, platform_post_id, *, age, attempted_ago=None, failures=0):
+        from apps.composer.models import PlatformPost
+
+        post = _published_post(account, age=age, platform_post_id=platform_post_id)
+        if attempted_ago is not None or failures:
+            PlatformPost.objects.filter(pk=post.pk).update(
+                analytics_attempted_at=timezone.now() - attempted_ago if attempted_ago is not None else None,
+                analytics_failure_count=failures,
+            )
+        return post
+
+    def _sync(self, account, provider):
+        from apps.analytics.tasks import _sync_one_account
+
+        # ``needs_reconnect`` accounts skip the channel reports, leaving only the post sweep.
+        with patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")):
+            _sync_one_account(account, timezone.now().date(), timezone.now(), cache={})
+
+    def _batch_provider(self):
+        from providers.types import PostMetrics
+
+        provider = _provider(batch_size=50)
+        provider.get_post_metrics_batch.side_effect = lambda _tok, ids: {i: PostMetrics(video_views=1) for i in ids}
+        return provider
+
+    def test_not_yet_due_posts_ride_along_with_a_due_one(self, workspace):
+        from apps.composer.models import PlatformPost
+
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        self._post(account, "new", age=timedelta(hours=2))
+        # Each at least halfway to due on its own rung.
+        self._post(account, "six-hourly", age=timedelta(days=3), attempted_ago=timedelta(hours=4))
+        self._post(account, "daily", age=timedelta(days=10), attempted_ago=timedelta(hours=13))
+        self._post(account, "weekly", age=timedelta(days=40), attempted_ago=timedelta(days=4))
+        provider = self._batch_provider()
+
+        self._sync(account, provider)
+
+        assert provider.get_post_metrics_batch.call_count == 1
+        sent = provider.get_post_metrics_batch.call_args.args[1]
+        assert sent[0] == "new"
+        assert set(sent) == {"new", "six-hourly", "daily", "weekly"}
+        cutoff = timezone.now() - timedelta(minutes=1)
+        assert all(p.analytics_attempted_at > cutoff for p in PlatformPost.objects.filter(social_account=account))
+
+    def test_failing_and_out_of_window_posts_stay_out(self, workspace):
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        self._post(account, "new", age=timedelta(hours=2))
+        self._post(account, "failing", age=timedelta(days=3), attempted_ago=timedelta(hours=2), failures=1)
+        self._post(account, "ancient", age=timedelta(days=120), attempted_ago=timedelta(days=30))
+        provider = self._batch_provider()
+
+        self._sync(account, provider)
+
+        assert provider.get_post_metrics_batch.call_args.args[1] == ["new"]
+
+    def test_only_empty_slots_are_filled_soonest_due_first(self, workspace):
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        for i in range(49):
+            self._post(account, f"due-{i}", age=timedelta(hours=2))
+        # Six-hourly rung, both past halfway: due in 1h vs due in 2h.
+        self._post(account, "sooner", age=timedelta(days=3), attempted_ago=timedelta(hours=5))
+        self._post(account, "later", age=timedelta(days=3), attempted_ago=timedelta(hours=4))
+        provider = self._batch_provider()
+
+        self._sync(account, provider)
+
+        assert provider.get_post_metrics_batch.call_count == 1
+        sent = provider.get_post_metrics_batch.call_args.args[1]
+        assert len(sent) == 50
+        assert "sooner" in sent
+        assert "later" not in sent
+
+    def test_posts_short_of_halfway_to_due_stay_out(self, workspace):
+        """Otherwise one hourly post would rewrite the whole catalogue's snapshots every tick."""
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        self._post(account, "new", age=timedelta(hours=2))
+        self._post(account, "six-hourly", age=timedelta(days=3), attempted_ago=timedelta(hours=2))
+        self._post(account, "weekly", age=timedelta(days=40), attempted_ago=timedelta(days=3))
+        provider = self._batch_provider()
+
+        self._sync(account, provider)
+
+        assert provider.get_post_metrics_batch.call_args.args[1] == ["new"]
+
+    def test_a_full_last_chunk_gets_nothing_added(self, workspace):
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        for i in range(50):
+            self._post(account, f"due-{i}", age=timedelta(hours=2))
+        self._post(account, "not-due", age=timedelta(days=3), attempted_ago=timedelta(hours=5))
+        provider = self._batch_provider()
+
+        self._sync(account, provider)
+
+        assert provider.get_post_metrics_batch.call_count == 1
+        assert "not-due" not in provider.get_post_metrics_batch.call_args.args[1]
+
+    def test_nothing_due_means_no_call(self, workspace):
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        self._post(account, "six-hourly", age=timedelta(days=3), attempted_ago=timedelta(hours=2))
+        provider = self._batch_provider()
+
+        self._sync(account, provider)
+
+        provider.get_post_metrics_batch.assert_not_called()
+
+    def test_unbatched_platforms_send_only_what_is_due(self, workspace):
+        from providers.types import PostMetrics
+
+        account = _youtube_account(workspace, platform_id="yt-fill", needs_reconnect=True)
+        self._post(account, "new", age=timedelta(hours=2))
+        self._post(account, "six-hourly", age=timedelta(days=3), attempted_ago=timedelta(hours=2))
+        provider = _provider(batch_size=1)
+        provider.get_post_metrics.return_value = PostMetrics(video_views=1)
+
+        self._sync(account, provider)
+
+        assert [c.args[1] for c in provider.get_post_metrics.call_args_list] == ["new"]
+
+
+@pytest.mark.django_db
 class TestQuotaBreaker:
     """Once the platform says "budget spent", every further call is waste."""
 
@@ -618,7 +799,7 @@ class TestQuotaBreaker:
         account = _youtube_account(workspace, platform_id="yt-1", needs_reconnect=False)
         provider = _provider(batch_size=1)
         provider.account_metrics_supports_date_range = True
-        provider.get_account_metrics.side_effect = QuotaExceededError("spent", quota_scope="analytics")
+        provider.get_channel_daily_metrics.side_effect = QuotaExceededError("spent", quota_scope="analytics")
 
         with patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")):
             _sync_one_account(account, timezone.now().date(), timezone.now(), cache={})
@@ -639,7 +820,7 @@ class TestQuotaBreaker:
         _published_post(account)
         provider = _provider(batch_size=50)
         provider.account_metrics_supports_date_range = True
-        provider.get_account_metrics.side_effect = QuotaExceededError("spent", quota_scope="analytics")
+        provider.get_channel_daily_metrics.side_effect = QuotaExceededError("spent", quota_scope="analytics")
         provider.get_post_metrics_batch.return_value = {}
 
         with patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")):
@@ -1154,6 +1335,7 @@ class TestSyncAllAccountAnalyticsEfficiency:
         with (
             patch("apps.analytics.tasks.timezone.now", side_effect=[first_attempt, second_attempt]),
             patch("apps.analytics.tasks._record_post_sync_failure") as record_failure,
+            patch("apps.analytics.tasks._record_analytics_error"),
         ):
             _sync_account_posts(account, provider, "tok", posts, first_attempt.date())
 

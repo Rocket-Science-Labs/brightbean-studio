@@ -22,6 +22,7 @@ from unittest.mock import patch
 from django.test import TransactionTestCase, override_settings
 from django.utils import timezone
 
+from apps.common.worker import WORKER_EXECUTION_THREADS
 from apps.composer.models import PlatformPost, Post
 from apps.organizations.models import Organization
 from apps.publisher import engine
@@ -163,7 +164,8 @@ class BudgetArithmeticTest(TransactionTestCase):
 
         peak = (
             workers * threads  # gunicorn, one connection per thread
-            + 1  # the worker's own process_tasks connection
+            + 1  # the Studio dispatcher
+            + WORKER_EXECUTION_THREADS  # the publishing and general task execution threads
             + engine._max_concurrent_posts()
             + engine._max_concurrent_platform_publishes()
         )

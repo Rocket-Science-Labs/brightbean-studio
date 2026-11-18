@@ -188,7 +188,7 @@ All intervals configurable via F-1.6.
 
 ```
 app:      Django runserver + volume mount
-worker:   python manage.py process_tasks
+worker:   python manage.py run_studio_worker
 postgres: postgres:16-alpine
 
 Tailwind: `python manage.py tailwind start` on host (watches + recompiles)
@@ -198,7 +198,7 @@ Tailwind: `python manage.py tailwind start` on host (watches + recompiles)
 
 ```
 app:      Gunicorn (4 workers, 2 threads)
-worker:   python manage.py process_tasks
+worker:   python manage.py run_studio_worker
 postgres: postgres:16-alpine
 caddy:    Reverse proxy + auto-TLS
 
@@ -250,7 +250,7 @@ Config: `Procfile` + `app.json` (enables "Deploy to Heroku" button).
 **Procfile:**
 ```
 web: gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --threads 2
-worker: python manage.py process_tasks
+worker: python manage.py run_studio_worker
 ```
 
 **app.json** pre-configures: Basic dynos, PostgreSQL Essential-0, auto-generated SECRET_KEY, post-deploy migration, env var prompts. README includes deploy button linking to `https://heroku.com/deploy?template=https://github.com/yourorg/social-platform` - running app in ~5 minutes.
@@ -554,7 +554,7 @@ python manage.py tailwind start     # watches + recompiles CSS
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py runserver           # terminal 1
-python manage.py process_tasks       # terminal 2
+python manage.py run_studio_worker       # terminal 2
 ```
 
 Or: `docker compose up` (Tailwind builds inside Dockerfile).

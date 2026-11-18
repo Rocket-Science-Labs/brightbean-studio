@@ -438,6 +438,11 @@ def connection_oauth_callback(request, platform):
             PlatformCredential.Platform.INSTAGRAM,
         ) and hasattr(provider, "get_user_pages"):
             tokens, promoted = promote_meta_user_token(provider, platform, tokens)
+            user_expires_at = (
+                timezone.now() + timezone.timedelta(seconds=tokens.expires_in)
+                if platform == "instagram" and tokens.expires_in
+                else None
+            )
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
                 from providers.types import AccountProfile
@@ -496,9 +501,14 @@ def connection_oauth_callback(request, platform):
                         # dies with it — store that expiry or the health and
                         # publish checks skip the account until it just fails.
                         expires_in=None if promoted else tokens.expires_in,
+                        facebook_user_access_token=tokens.access_token if platform == "instagram" else None,
+                        facebook_user_token_expires_at=user_expires_at,
                         # Instagram-via-Facebook receives its webhooks through
                         # the linked Page, so remember which Page to subscribe.
                         webhook_target_id=page.get("page_id", ""),
+                        messaging_access=False
+                        if platform == "instagram" and not page.get("access_token")
+                        else page.get("can_message"),
                     )
                     ConnectionLinkUsage.objects.get_or_create(
                         connection_link=link,

@@ -329,6 +329,8 @@ class Post(models.Model):
 
 
 class PlatformPost(models.Model):
+    youtube_video_checked_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
     """A per-platform variant of a Post.
 
     Created for each selected social account when composing. Holds optional

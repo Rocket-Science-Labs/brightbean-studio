@@ -231,7 +231,7 @@ def test_concurrent_sends_deliver_draft_once(message):
     release_dispatch = Event()
     second_started = Event()
 
-    def dispatch(message, body):
+    def dispatch(message, body, **kwargs):
         dispatch_started.set()
         assert release_dispatch.wait(timeout=10)
         return "sent-once"

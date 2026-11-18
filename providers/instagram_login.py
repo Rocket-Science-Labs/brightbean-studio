@@ -26,7 +26,13 @@ from .meta_comments import (
     resolve_comment_reply_target,
 )
 from .meta_insights import fetch_insights_safe
-from .meta_messaging import build_send_payload, resolve_recipient_id
+from .meta_messaging import (
+    build_send_payload,
+    dm_extra,
+    require_message_id,
+    resolve_recipient_id,
+    validate_instagram_text,
+)
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -81,7 +87,7 @@ INSTAGRAM_MEDIA_FIELDS = [
 
 # Container polling
 CONTAINER_POLL_INTERVAL = 2  # seconds
-CONTAINER_POLL_MAX_ATTEMPTS = 60  # ~2 minutes max
+CONTAINER_POLL_TIMEOUT = 120  # seconds
 
 
 class InstagramLoginProvider(SocialProvider):
@@ -306,6 +312,7 @@ class InstagramLoginProvider(SocialProvider):
             raise PublishError(
                 "Instagram requires at least one media item",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         if content.post_type == PostType.CAROUSEL and len(content.media_urls) > 1:
@@ -387,7 +394,8 @@ class InstagramLoginProvider(SocialProvider):
 
     def _wait_for_container(self, access_token: str, container_id: str) -> None:
         """Poll container status until FINISHED or error."""
-        for _ in range(CONTAINER_POLL_MAX_ATTEMPTS):
+
+        def finished() -> bool:
             resp = self._request(
                 "GET",
                 f"{API_BASE}/{container_id}",
@@ -396,21 +404,19 @@ class InstagramLoginProvider(SocialProvider):
             )
             data = resp.json()
             status = data.get("status_code", "")
-
-            if status == "FINISHED":
-                return
             if status == "ERROR":
                 raise PublishError(
                     f"Instagram container failed: {data.get('status', 'unknown error')}",
                     platform=self.platform_name,
                     raw_response=data,
                 )
+            return status == "FINISHED"
 
-            time.sleep(CONTAINER_POLL_INTERVAL)
-
-        raise PublishError(
-            "Instagram container processing timed out",
-            platform=self.platform_name,
+        self._poll_until(
+            finished,
+            deadline=time.monotonic() + CONTAINER_POLL_TIMEOUT,
+            interval=CONTAINER_POLL_INTERVAL,
+            on_timeout=lambda: PublishError("Instagram container processing timed out", platform=self.platform_name),
         )
 
     def _publish_container(self, access_token: str, container_id: str) -> PublishResult:
@@ -552,7 +558,7 @@ class InstagramLoginProvider(SocialProvider):
                 messages.extend(fetch(access_token, since))
             except Exception as exc:
                 failures.append(exc)
-                logger.warning("Instagram Login %s poll failed: %s", label, exc)
+                logger.warning("Instagram Login %s poll failed: error_type=%s", label, type(exc).__name__)
 
         if failures and not messages:
             raise failures[0]
@@ -577,7 +583,7 @@ class InstagramLoginProvider(SocialProvider):
         )
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        params: dict = {"fields": "id,participants,messages{id,message,from,created_time}"}
+        params: dict = {"fields": "id,participants,messages{id,message,from,created_time,attachments}"}
         if since:
             params["since"] = int(since.timestamp())
 
@@ -610,7 +616,7 @@ class InstagramLoginProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the IGSID the messaging endpoint replies to.
-                        extra={"conversation_id": convo["id"], "sender_id": sender_id},
+                        extra=dm_extra(msg, sender_id=sender_id, conversation_id=convo["id"]),
                     )
                 )
         return messages
@@ -633,6 +639,7 @@ class InstagramLoginProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
+        validate_instagram_text(text, platform=self.platform_name)
         payload = build_send_payload(igsid, text, human_agent=human_agent)
 
         resp = self._request(
@@ -642,7 +649,7 @@ class InstagramLoginProvider(SocialProvider):
             json=payload,
         )
         data = resp.json()
-        return ReplyResult(platform_message_id=data.get("message_id", ""), extra=data)
+        return ReplyResult(platform_message_id=require_message_id(data, platform=self.platform_name), extra=data)
 
     def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
         """Reply to a comment, or comment on a media item.

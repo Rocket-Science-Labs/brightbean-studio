@@ -49,6 +49,19 @@ class TestBackfillInbox:
 
         assert provider.get_messages.call_args.kwargs["deep"] is True
 
+    def test_youtube_uses_the_stored_channel_id(self, backfill_workspace):
+        """No ``channels.list`` unit spent per page on an id the account already stores."""
+        _account(backfill_workspace, "youtube", "yt-backfill")
+        provider = MagicMock()
+        provider.get_messages.return_value = []
+
+        with patch("apps.inbox.management.commands.backfill_inbox.get_provider", return_value=provider):
+            call_command("backfill_inbox", "--days", "90", stdout=StringIO())
+
+        assert provider.get_messages.call_args.kwargs["channel_id"] == "yt-backfill"
+        # Explicit seeding has no later walk to recover a skip, so it fetches every reply thread.
+        assert "stored_reply_counts" not in provider.get_messages.call_args.kwargs
+
     def test_youtube_continues_after_a_deep_page_cap(self, backfill_workspace):
         _account(backfill_workspace, "youtube", "yt-backfill")
         provider = MagicMock()

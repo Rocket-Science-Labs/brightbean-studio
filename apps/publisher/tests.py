@@ -155,9 +155,12 @@ class DispatchExtraInjectionTest(SimpleTestCase):
         _access_token, content = mock_provider.publish_post.call_args.args
         self.assertEqual(content.extra.get("author"), "urn:li:organization:98765")
 
+    # The mocked post has no attachments, which the pre-flight would refuse
+    # for Instagram; that check has its own tests, this one pins the injection.
+    @patch("apps.publisher.engine.publish_blocker", return_value="")
     @patch("apps.publisher.engine.get_provider")
     @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
-    def test_injects_ig_user_id_for_instagram(self, _mock_creds, mock_get_provider):
+    def test_injects_ig_user_id_for_instagram(self, _mock_creds, mock_get_provider, _mock_blocker):
         engine, platform_post, mock_provider = _build_dispatch_mocks(
             platform="instagram",
             account_platform_id="17841400000000000",
@@ -169,6 +172,31 @@ class DispatchExtraInjectionTest(SimpleTestCase):
         mock_provider.publish_post.assert_called_once()
         _access_token, content = mock_provider.publish_post.call_args.args
         self.assertEqual(content.extra.get("ig_user_id"), "17841400000000000")
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_passes_a_stable_idempotency_key_and_publish_runtime(self, _mock_creds, mock_get_provider):
+        from apps.common.worker import SHUTDOWN_REQUESTED
+        from apps.publisher.engine import _provider_upload_cache
+
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            platform="mastodon",
+            account_platform_id="109",
+        )
+        platform_post.id = "4f1c"
+        mock_get_provider.return_value = mock_provider
+
+        engine._dispatch_to_provider(platform_post)
+        engine._dispatch_to_provider(platform_post)
+
+        contents = [call.args[1] for call in mock_provider.publish_post.call_args_list]
+        # Every retry of the row must send the same key, or the platform cannot
+        # recognise a repeat of a post it already created.
+        self.assertEqual([c.idempotency_key for c in contents], ["brightbean-4f1c", "brightbean-4f1c"])
+        # A typed field, not a key smuggled into the authored extras.
+        self.assertNotIn("idempotency_key", contents[0].extra)
+        self.assertIs(contents[0].upload_cache, _provider_upload_cache)
+        self.assertEqual(contents[0].should_stop, SHUTDOWN_REQUESTED.is_set)
 
     @patch("apps.publisher.engine.get_provider")
     @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
@@ -406,6 +434,136 @@ class NonRetryableFailureTest(TestCase):
         self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
         self.assertEqual(self.platform_post.next_retry_at, reset_at)
         self.assertEqual(self.platform_post.retry_count, 1)
+
+    def _fail_with(self, error):
+        with patch.object(PublishEngine, "_dispatch_to_provider", side_effect=error):
+            PublishEngine()._publish_platform_post(self.platform_post)
+        self.platform_post.refresh_from_db()
+
+    def _set_token_expiry(self, expires_at):
+        self.account.token_expires_at = expires_at
+        self.account.save(update_fields=["token_expires_at"])
+        # The engine reads the account through the platform post, so the
+        # cached relation has to see the new expiry too.
+        self.platform_post.social_account = self.account
+
+    def test_a_401_on_a_live_token_fails_immediately_with_reconnect_advice(self):
+        """Pinterest's missing boards:write was retried for an hour and a half,
+        then reported as "kept failing". No retry changes a refused grant."""
+        from apps.composer.models import PlatformPost
+        from apps.social_accounts.error_messages import PUBLISH_RECONNECT_MESSAGE
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        self._fail_with(APIError("Pinterest API error 401: Missing: ['boards:write']", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.retry_count, 0)
+        self.assertEqual(self.platform_post.publish_error, PUBLISH_RECONNECT_MESSAGE)
+
+    def test_a_401_on_an_expired_token_keeps_its_retries(self):
+        """The refresh before the next attempt may yet go through."""
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() - timedelta(minutes=5))
+        self._fail_with(APIError("expired", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def test_a_401_after_the_token_was_rotated_elsewhere_keeps_its_retries(self):
+        """The refusal was for the copy this attempt loaded; another process has
+        since stored a new token, and the retry reloads the account to use it."""
+        from apps.composer.models import PlatformPost
+        from apps.social_accounts.models import SocialAccount
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        SocialAccount.objects.filter(pk=self.account.pk).update(oauth_access_token="rotated-by-refresh-task")
+        self._fail_with(APIError("expired", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def test_a_token_re_read_that_fails_keeps_the_retry(self):
+        """The re-read runs inside the publish path's except block; if it
+        raised, the row would be stranded in ``publishing``."""
+        from django.db import DatabaseError
+
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        with patch(
+            "apps.social_accounts.models.SocialAccount.objects.filter",
+            side_effect=DatabaseError("connection lost"),
+        ):
+            self._fail_with(APIError("refused", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def test_a_403_that_runs_out_of_retries_does_not_end_on_reconnect_advice(self):
+        """A bare 403 can be a throttle; "reconnect" would send a healthy
+        account to reconnect."""
+        from apps.composer.models import PlatformPost
+        from apps.social_accounts.error_messages import PUBLISH_EXHAUSTED_MESSAGE
+        from providers.exceptions import APIError
+
+        self.platform_post.retry_count = MAX_RETRIES
+        self.platform_post.save(update_fields=["retry_count"])
+        self._fail_with(APIError("forbidden", status_code=403))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.publish_error, PUBLISH_EXHAUSTED_MESSAGE)
+
+    def test_a_post_the_platform_can_only_refuse_fails_before_any_platform_call(self):
+        """The pre-flight every scheduled row passes, however it was scheduled."""
+        from apps.composer.models import PlatformPost
+
+        with patch("apps.publisher.engine._provider_and_access_token") as token:
+            PublishEngine()._publish_platform_post(self.platform_post)
+
+        token.assert_not_called()
+        self.platform_post.refresh_from_db()
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.retry_count, 0)
+        self.assertTrue(self.platform_post.publish_error.startswith("TikTok can only publish videos"))
+        self.assertIn(
+            "TikTok can only publish videos",
+            PublishLog.objects.get(platform_post=self.platform_post).error_message,
+        )
+
+    def test_a_401_with_an_unknown_expiry_keeps_its_retries(self):
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(None)
+        self._fail_with(APIError("refused", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+
+    def test_a_403_keeps_its_retries(self):
+        """Some platforms throttle with 403; stopping on it would drop a retry that works."""
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        self._fail_with(APIError("forbidden", status_code=403))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+
+    def test_running_out_of_retries_keeps_a_specific_message(self):
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import PublishError
+
+        self.platform_post.retry_count = MAX_RETRIES
+        self.platform_post.save(update_fields=["retry_count"])
+        self._fail_with(PublishError("Instagram container processing timed out", platform="Instagram"))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.publish_error, "Instagram container processing timed out")
 
 
 class PublishedPostLeavesQueueTest(TestCase):
@@ -932,3 +1090,22 @@ class DispatchLinkedInMediaTest(SimpleTestCase):
                 _token, content = mock_provider.publish_post.call_args.args
                 self.assertEqual(content.post_type, PostType.VIDEO)
                 self.assertEqual(len(content.media_files), 1)
+
+
+class ProviderUploadCacheTest(SimpleTestCase):
+    def test_round_trips_through_the_default_cache(self):
+        from apps.publisher.engine import _provider_upload_cache
+
+        _provider_upload_cache.set("mastodon-media:a:b", "m1", 60)
+
+        self.assertEqual(_provider_upload_cache.get("mastodon-media:a:b"), "m1")
+
+    @patch("apps.publisher.engine.cache")
+    def test_cache_outage_costs_a_reupload_not_a_publish(self, mock_cache):
+        from apps.publisher.engine import _provider_upload_cache
+
+        mock_cache.get.side_effect = ConnectionError("redis down")
+        mock_cache.set.side_effect = ConnectionError("redis down")
+
+        self.assertIsNone(_provider_upload_cache.get("k"))
+        _provider_upload_cache.set("k", "v", 60)
